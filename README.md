@@ -46,10 +46,12 @@ Outcomes in high-rise and topographically complex areas appear less likely to st
    6. multinomial_gam_sensitivity_building_height_definition.Rmd
    7. multinomial_gam_sensitivity_favela_by_elevation.Rmd
   
-**Note:** The scripts are intended to be run sequentially, as intermediate objects generated in earlier steps are used by subsequent analyses. All required data is included in this repository, except raw Brazil Census 2022 https://ftp.ibge.gov.br/Censos/Censo_Demografico_2022/ and household income https://ftp.ibge.gov.br/Censos/Censo_Demografico_2022/Agregados_por_Setores_Censitarios_Rendimento_do_Responsavel/. The required files are: Agregados_por_bairros_renda_responsavel_BR.csv, Agregados_por_setores_alfabetizacao_BR.csv, Agregados_por_setores_basico_BR_20250417.csv, Agregados_por_setores_caracteristicas_domicilio2_BR_20250417.csv, RJ_bairros_CD2022.gpkg, RJ_setores_CD2022.gpkg. Also not included are the files GSV_container_counts.json and water_tank_density.tif, which are available upon request from Dr Steffen Knoblauch.
-  
 <br>
   
-The raw data for this project is sourced from https://github.com/pdgcam/wMel_Rio_dengue_chik which supports the manuscript:  
+**Note:**  
+- The scripts are intended to be run sequentially, however intermediate datasets are saved here to be used by subsequent analyses.  
+- All required data is included in this repository, except raw Brazil 2022 Census data sourced from https://ftp.ibge.gov.br/Censos/Censo_Demografico_2022/ and household income data sourced from https://ftp.ibge.gov.br/Censos/Censo_Demografico_2022/Agregados_por_Setores_Censitarios_Rendimento_do_Responsavel/. The required files are: Agregados_por_bairros_renda_responsavel_BR.csv, Agregados_por_setores_alfabetizacao_BR.csv, Agregados_por_setores_basico_BR_20250417.csv, Agregados_por_setores_caracteristicas_domicilio2_BR_20250417.csv, RJ_bairros_CD2022.gpkg, RJ_setores_CD2022.gpkg. Also not included are the raw predictor data files GSV_container_counts.json and water_tank_density.tif, which are available upon request from Dr Steffen Knoblauch.  
+- All processed predictor data is available to run the model screening script and sensitivity analyses.  
+- The raw Wolbachia prevalence data for this project is sourced from https://github.com/pdgcam/wMel_Rio_dengue_chik which supports the manuscript:  
   
 Ribeiro dos Santos G, Durovni B, Saraceni V, Souza Riback TI, Pinto SB, Anders KL, et al. Estimating the effect of the wMel release programme on the incidence of dengue and chikungunya in Rio de Janeiro, Brazil: A spatiotemporal modelling study. Lancet Infect Dis. 2022;22(11):1587–95. doi:10.1016/S1473-3099(22)00436-4
