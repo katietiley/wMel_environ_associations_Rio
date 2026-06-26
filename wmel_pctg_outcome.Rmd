@@ -1,0 +1,489 @@
+---
+title: "wmel_pctg_outcome"
+author: "K Tiley"
+date: "2026-06-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(mgcv)
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(broom)
+library(ggplot2)
+library(ggpattern)
+library(patchwork)
+library(cluster)
+library(sf)
+
+```
+
+## Load data
+
+```{r analysis_dataset}
+
+wmel_rio_releases <- readRDS("wmel_with_temp.rds") %>%
+  rename(timepoint = t)
+
+```
+
+## Explore sample-size per cell / missingness
+
+```{r cell_level_summary, warning=FALSE}
+
+cell_summary <- wmel_rio_releases %>%
+  group_by(cell.id) %>%
+  summarise(
+    n_samples = sum(!is.na(wmel_pctg)),
+    n_missing = sum(is.na(wmel_pctg)),
+    prop_missing = n_missing / n(),
+    mean_pctg = mean(wmel_pctg, na.rm = TRUE),
+    sd_pctg = sd(wmel_pctg, na.rm = TRUE),
+    max_pctg = max(wmel_pctg, na.rm = TRUE),
+    min_pctg = min(wmel_pctg, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+```{r mean_vs_sd_plot, fig.height=8, fig.width=10, warning=FALSE}
+
+mean_sd_plot <- ggplot(cell_summary, aes(x = mean_pctg, y = sd_pctg)) +
+  geom_point(aes(color = n_samples), size = 2) +
+  scale_color_viridis_c(option = "D", direction = -1) +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linetype = "dashed", linewidth = 0.7) +  # all cells
+  labs(x = "Mean %wMel", y = "SD %wMel",
+       color = "Sample n",
+       title = "For each cell across entire release period") +
+  theme_minimal()
+mean_sd_plot
+
+```
+
+```{r missingness_vs_mean_sd, fig.height=8, fig.width=8, warning=FALSE}
+
+missingness_mean_plot <- ggplot(cell_summary, aes(x = prop_missing, y = mean_pctg)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred") +
+  labs(x = "Proportion Missing", y = "Mean %wMel") +
+  theme_minimal()
+
+missingness_sd_plot <- ggplot(cell_summary, aes(x = prop_missing, y = sd_pctg)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "darkred") +
+  labs(x = "Proportion Missing", y = "SD %wMel") +
+  theme_minimal()
+
+missingness_panel <- wrap_plots(missingness_mean_plot,missingness_sd_plot, nrow = 2)
+missingness_panel
+
+```
+
+```{r missingness_heatmap, fig.height=6, fig.width=8, warning=FALSE}
+
+missingness_matrix <- wmel_rio_releases %>%
+  mutate(missing = is.na(wmel_pctg)) %>%
+  group_by(cell.id, date) %>%
+  summarise(missing = any(missing),
+            .groups = "drop")
+
+missingness_matrix_plot <- ggplot(missingness_matrix, aes(x = date, y = factor(cell.id), fill = missing)) +
+  geom_tile() +
+  scale_fill_manual(values = c("FALSE" = "white", "TRUE" = "red"), name = "Missing") +
+  labs(x = "Month", y = "Cell ID", title = "Missingness Heatmap") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+missingness_matrix_plot
+
+```
+
+```{r missingness_spatial, fig.height=6, fig.width=8, warning=FALSE}
+
+missing_summary_spatial <- wmel_rio_releases %>%
+  group_by(cell.id) %>%
+  summarise(
+    n_total = n(),
+    n_missing = sum(is.na(wmel_pctg)),
+    prop_missing = n_missing / n_total,
+    geometry = first(geometry),
+    .groups = "drop"
+  )
+
+missingness_map <- ggplot(missing_summary_spatial) +
+  geom_sf(aes(fill = prop_missing)) +
+  scale_fill_gradient(low = "white", high = "red", na.value = "grey90", name = "Proportion\nMissing") +
+  theme_minimal() +
+  ggtitle("Spatial Distribution of Missing %wMel Values")
+missingness_map
+
+```
+
+How many cells had any wMel data?
+
+```{r missingness_any_data, warning=FALSE}
+
+cells_any_wmel <- wmel_rio_releases %>%
+  group_by(cell.id) %>%
+  summarise(
+    has_any_data = any(!is.na(wmel_pctg)),
+    n_samples = sum(!is.na(wmel_pctg)),
+    .groups = "drop"
+  ) %>%
+  filter(has_any_data)
+
+n_cells_any_wmel <- n_distinct(cells_any_wmel$cell.id)
+n_cells_any_wmel
+
+```
+
+How many of those cells had <=5 months of wMel data?
+
+```{r missingness_few_samples, warning=FALSE}
+
+cells_sample_size <- wmel_rio_releases %>%
+  filter(cell.id %in% cells_any_wmel$cell.id) %>%
+  group_by(cell.id) %>%
+  summarise(
+    n_samples = sum(!is.na(wmel_pctg)),
+    .groups = "drop"
+  ) %>%
+  mutate(status = ifelse(
+    n_samples <= 5,
+    "Excluded (≤5 months)",
+    "Retained (>5 months)")
+    )
+
+cells_lt5 <- cells_sample_size %>%
+  filter(n_samples <= 5)
+
+n_cells_lt5 <- n_distinct(cells_lt5$cell.id)
+n_cells_lt5
+
+```
+
+Which of those cells had <=5 months of wMel data?
+
+```{r small_sample_map, fig.height=6, fig.width=8, warning=FALSE}
+
+excluded_cells_map <- ggplot(cells_sample_size) +
+  geom_sf(aes(fill = status), colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = c("Retained (>5 months)" = "grey90", "Excluded (≤5 months)" = "red"), name = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+excluded_cells_map
+
+```
+
+Average and range of missingness % for all remaining cells:
+
+```{r missingness_summary_remaining, warning=FALSE}
+
+cells_ge5 <- cells_sample_size %>%
+  filter(n_samples > 5)
+
+missingness_by_cell <- wmel_rio_releases %>%
+  filter(cell.id %in% cells_ge5$cell.id) %>%
+  group_by(cell.id) %>%
+  summarise(
+    n_missing = sum(is.na(wmel_pctg)),
+    n_total = n(),
+    pct_missing = n_missing / n_total,
+    .groups = "drop"
+  )
+
+summary(missingness_by_cell$pct_missing)
+
+```
+
+
+## Prepare model data
+
+#### Define month of release:
+
+```{r define_relative_month, warning=FALSE}
+
+wmel_rio_releases <- wmel_rio_releases %>%
+  arrange(cell.id, timepoint) %>%
+  group_by(cell.id) %>%
+  mutate(
+    first_valid = match(TRUE, !is.na(wmel_pctg)),
+    month_of_release = if_else(
+      row_number() >= first_valid,
+      row_number() - first_valid + 1,
+      NA_integer_
+    )
+  ) %>%
+  ungroup()
+
+```
+
+#### Exclude low-sample cells (<=5)
+
+Sanity check: How many cells have >5 months of data? Should be 287-20 = 267
+```{r check_sample_size}
+
+cells_keep <- cells_sample_size %>%
+  filter(n_samples > 5) %>%
+  pull(cell.id)
+length(cells_keep)
+
+```
+
+```{r filter_sample_size}
+
+wmel_model_data <- wmel_rio_releases %>%
+  filter(cell.id %in% cells_keep) %>%
+  group_by(cell.id) %>%
+  mutate(n_samples = sum(!is.na(wmel_pctg))) %>%
+  ungroup() %>%
+  mutate(release_zone = factor(case_when(release_zone %in% c("RJ3.1", "RJ3.2", "RJ3.3") ~ "RJ3", TRUE ~ release_zone))) # combine RJ3 zones
+
+```
+
+Compare sample sizes by release zone:
+
+```{r release_zone_sample_size, warning=FALSE}
+
+release_zone_summary <- wmel_model_data %>%
+  sf::st_drop_geometry() %>%
+  group_by(release_zone) %>%
+  summarise(
+    n_cells = n_distinct(cell.id),
+    mean_samples = mean(n_samples, na.rm = TRUE),
+    median_samples = median(n_samples, na.rm = TRUE),
+    sd_samples = sd(n_samples, na.rm = TRUE),
+    min_samples = min(n_samples, na.rm = TRUE),
+    max_samples = max(n_samples, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+release_zone_summary
+
+```
+
+```{r release_zone_sample_size_plot, fig.height=6, fig.width=8, warning=FALSE}
+
+cell_samples <- wmel_model_data %>%
+  sf::st_drop_geometry() %>%
+  distinct(cell.id, release_zone, n_samples)
+
+ggplot(cell_samples, aes(release_zone, n_samples)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(x = "Release zone", y = "Number of samples") +
+  theme_minimal()
+
+```
+
+#### Manuscript Figure 1. Map of raster cell sample sizes by Wolbachia release zones
+
+```{r sample_size_map, fig.height=6, fig.width=8, warning=FALSE}
+
+# plot release zone outlines
+zone_outline <- wmel_model_data %>%
+  filter(!is.na(release_zone)) %>%   # keep only valid cells
+  group_by(release_zone) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop") %>%  # merge all polygons in the zone
+  st_cast("POLYGON")  # ensures polygon type is compatible with geom_sf
+
+# RJ city polygon
+#muni_rj_ll <- geobr::read_municipality(code_muni = "RJ", year = 2020, simplified = TRUE)
+#saveRDS(muni_rj_ll, "muni_rj_2020.rds")
+muni_rj_ll <- readRDS("muni_rj_2020.rds")
+rio_city_ll <- dplyr::filter(muni_rj_ll, name_muni == "Rio de Janeiro")
+neighbour1_ll <- dplyr::filter(muni_rj_ll, name_muni == "São João de Meriti")
+neighbour2_ll <- dplyr::filter(muni_rj_ll, name_muni == "Duque de Caxias")
+
+# RJ state and other administrative polygons
+#states_br_ll <- geobr::read_state(year = 2020, simplified = TRUE)
+#saveRDS(states_br_ll, "states_br_2020.rds")
+states_br_ll <- readRDS("states_br_2020.rds")
+rj_state_ll  <- dplyr::filter(states_br_ll, abbrev_state == "RJ")
+# fallback: rnaturalearth states (needs rnaturalearth + rnaturalearthdata)
+#states_br_ll <- rnaturalearth::ne_states(country = "Brazil", returnclass = "sf")
+#rj_state_ll  <- dplyr::filter(states_br_ll, name %in% c("Rio de Janeiro", "Rio de Janeiro State"))
+
+# match crs
+target_crs <- st_crs(zone_outline)
+neighbour1_ll <- st_transform(neighbour1_ll, target_crs)
+neighbour2_ll <- st_transform(neighbour2_ll, target_crs)
+rio_city_ll <- st_transform(rio_city_ll, target_crs)
+rj_state_ll <- st_transform(rj_state_ll, target_crs)
+wmel_rio_sf_samples <- st_transform(wmel_model_data, target_crs)
+
+# define bounding box
+crop_bb <- st_bbox(c(
+  xmin = 669293.5,
+  xmax = 689473.5,
+  ymin = 7467243.1,
+  ymax = 7480693
+), crs = st_crs(target_crs))
+
+# bbox for RJ city inset
+rj_bb   <- st_bbox(rio_city_ll)
+inset_xlim <- c(rj_bb["xmin"] - 0.02, rj_bb["xmax"] + 0.01)
+inset_ylim <- c(rj_bb["ymin"] - 0.01, rj_bb["ymax"] + 0.01)
+
+# release zone polygons and labels
+RJzone_labels <- data.frame(release_zone = c("RJ1", "RJ2", "RJ2", "RJ3", "RJ3"),
+                            x = c(686500,682100,674700,677500,673000),
+                            y = c(7478000,7476800,7475000,7472500,7476500))
+# RJ state and city labels
+lab_pt_city <- data.frame(lon = -43.44,
+                          lat = -22.93,
+                          label = "Municipality of\nRio de Janeiro")
+lab_pt_state <- data.frame(lon = -43.693,
+                           lat = -22.785,
+                           label = "State of\nRio de Janeiro")
+
+# RJ state inset plot
+deployment_inset <- ggplot() +
+  geom_sf(data = rj_state_ll,  fill = "white", color = "grey40", linewidth = 0.2) +
+  geom_sf(data = rio_city_ll,  fill = NA,     color = "black", linewidth = 0.5) +  # city outline
+  geom_sf(data = wmel_rio_sf_samples, fill = "#b30000", color = NA, size = 0.2, alpha = 0.8) + # greyscale
+  geom_text(data = lab_pt_state, aes(x = 634500, y = 7478000, label = "State of\nRio de Janeiro"), color = "grey40", size = 2.8, fontface = "bold") +
+  geom_text(data = lab_pt_city, aes(x = 658500, y = 7462800, label = "Municipality of\nRio de Janeiro"), color = "black", size = 3.8, fontface = "bold") +
+  coord_sf(xlim = c(622000,692000), ylim = c(7445000,7483500), expand = FALSE) +
+  theme_void() +
+  theme(panel.background = element_rect(fill = "#cfe8f3", colour = NA), # light blue ocean
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+        plot.margin  = margin(0,0,0,0))
+
+# plot map
+sample_size_map <- ggplot() +
+  geom_sf(data = neighbour1_ll, fill = "white", color = "grey40", linewidth = 0.2) +
+  geom_sf(data = neighbour2_ll, fill = "white", color = "grey40", linewidth = 0.2) +
+  geom_sf(data = rio_city_ll, fill = "white", color = "black", linewidth = 0.5) +
+  geom_sf(data = wmel_rio_sf_samples %>% filter(!is.na(n_samples)), aes(fill = n_samples), color = NA) + # use geom_sf for raster polygons with n_samples
+  geom_sf(data = zone_outline, fill = NA, color = "black", linewidth = 0.9) + # the outline for release zones
+  geom_text(aes(x = 686200, y = 7471700, label = "Atlantic\nOcean"), size = 3.8, fontface = "bold", color = "black") +
+  geom_text(data = RJzone_labels, aes(x = x, y = y, label = release_zone), size = 3.8, fontface = "bold", color = "black") +
+  coord_sf(crs = st_crs(wmel_rio_sf_samples),
+           xlim = c(crop_bb["xmin"] - 1000, crop_bb["xmax"] + 850),
+           ylim = c(crop_bb["ymin"] + 100, crop_bb["ymax"] + 180), expand = FALSE, clip = "on") +
+  scale_fill_gradient(name = "Sample\nsize (n)",
+                      low = "#DEEBF7", high = "#08519C", na.value = "grey70",
+                      limits = c(6,26)) +
+  labs(x = NULL, y = NULL, fill = NULL) +
+  theme_minimal() + 
+  theme(
+    panel.background = element_rect(fill = "#cfe8f3", colour = NA), # light blue ocean
+    legend.position = c(0.96, 0.08),
+    legend.justification = c(1, 0),
+    legend.background = element_rect(fill = "white", colour = "grey60"),
+    legend.box.margin = margin(4, 6, 4, 6),
+    legend.key.height = unit(10, "pt"),
+    legend.key.width  = unit(14, "pt")
+  )
+
+# combine final sample size map plot
+sample_size_map_with_inset <- cowplot::ggdraw() +
+  cowplot::draw_plot(sample_size_map) +
+  cowplot::draw_plot(deployment_inset,
+                     x = 0.065, y = 0.05,           # bottom-left corner (normalized 0–1)
+                     width = 0.30, height = 0.30)   # size relative to canvas
+sample_size_map_with_inset
+
+```
+
+
+## Fit binomial GLMs per cell
+
+```{r fit_binomial_glm, eval=FALSE, warning=FALSE}
+
+# Define binomial model outputs - estimate number of mosquitoes tested per sampling event
+wmel_model_data <- wmel_model_data %>%
+  mutate(n_tested = pmin(aegypti_captured, 10 * nb_trap_collections))
+
+# Nest data by spatial cell
+models_by_cell <- wmel_model_data %>%
+  group_by(cell.id) %>%
+  nest()
+
+# Fit binomial GLMs per cell
+fit_glm_cell <- function(df) {
+  tryCatch(
+    glm(
+      wmel_pctg ~ month_of_release + temp_c_mean_idw,
+      data    = df,
+      family  = binomial(link = "logit"),
+      weights = n_tested
+    ),
+    error = function(e) {
+      message("Model failed: ", e$message)
+      return(NULL)
+    }
+  )
+}
+models_by_cell$models <- lapply(models_by_cell$data, fit_glm_cell)
+
+#saveRDS(models_by_cell, "wmel_pctg_binomial_glm_models.rds")
+
+```
+
+## Predict wMel over 26-month deployment period
+
+```{r binomial_glm_predict, eval=FALSE}
+
+models_by_cell <- readRDS("wmel_pctg_binomial_glm_models.rds")
+
+
+# Build constant-temperature (per cell) prediction grid
+
+mean_temp_by_cell <- wmel_rio_releases_most_samples %>%
+  group_by(cell.id) %>%
+  summarise(temp_c_mean_idw = mean(temp_c_mean_idw, na.rm = TRUE)) %>%
+  rename(cell_id = cell.id) %>%
+  dplyr::select(cell_id, temp_c_mean_idw)
+month_grid <- data.frame(cell_id = rep(unique(models_by_cell$cell.id),each=26),
+                         month_of_release = rep(sort(unique(wmel_rio_releases_most_samples$month_of_release)),length(unique(models_by_cell$cell.id))))
+month_grid <- left_join(month_grid, mean_temp_by_cell, by = "cell_id") # ready to predict over constant temp (mean per cell)
+
+
+# Generate predictions
+
+predictions_list <- Map(function(model, cell_id) {
+  message("Predicting for cell.id: ", cell_id)  # logs cell.id to console
+  
+  if (inherits(model, "glm")) {
+    tryCatch(
+      predict(model, newdata = month_grid[month_grid$cell_id == cell_id, c("month_of_release", "temp_c_mean_idw")], type = "response"),
+      error = function(e) {
+        message("Prediction error for cell.id ", cell_id, ": ", conditionMessage(e))
+        rep(NA, nrow(month_grid))
+      }
+    )
+  } else {
+    rep(NA, nrow(month_grid))
+  }
+}, models_by_cell$models, models_by_cell$cell.id)
+
+models_by_cell$predictions <- predictions_list # add predictions to the dataframe directly
+
+
+# Remove cells with failed fits
+
+models_valid <- models_by_cell %>%
+  filter(!is.na(models))
+
+#saveRDS(models_valid, "wmel_pctg_binomial_glm_models_FittedRawTemp_PredictMeanTemp.rds")
+
+```
+
+Sanity check: are predictions bounded by 0 and 1?
+
+```{r predictions_check, warnings=FALSE}
+
+models_valid <- readRDS("wmel_pctg_binomial_glm_models_FittedRawTemp_PredictMeanTemp.rds")
+
+prediction_matrix <- do.call(rbind, models_valid$predictions)  # rows by cell.id, 26 columns for month timepoints
+
+hist(prediction_matrix, breaks = 100)
+summary(as.vector(prediction_matrix))
+
+```
+

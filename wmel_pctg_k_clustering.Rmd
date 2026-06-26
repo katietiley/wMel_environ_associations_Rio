@@ -1,0 +1,482 @@
+---
+title: "wmel_pctg_k_clustering"
+author: "K Tiley"
+date: "2026-06-18"
+output: html_document
+---
+
+Purpose of script is to load final predicted trajectories and compare k for k-means clustering.
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cluster)
+library(purrr)
+library(tibble)
+library(fpc)
+library(patchwork)
+library(ggalluvial)
+```
+
+## Load predicted trajectories
+
+```{r load_data}
+
+models_valid <- readRDS("wmel_pctg_binomial_glm_models_FittedRawTemp_PredictMeanTemp.rds")
+
+prediction_matrix <- do.call(rbind, models_valid$predictions)
+rownames(prediction_matrix) <- models_valid$cell.id
+summary(as.vector(prediction_matrix))
+
+```
+
+## Fit k-means clustering for k = 3–6
+
+```{r fit_k}
+
+set.seed(42)
+k_values <- 3:6
+
+kmeans_results <- setNames(
+  lapply(k_values, function(k) {
+    kmeans(prediction_matrix, centers = k, nstart = 25)
+  }),
+  paste0("k", k_values)
+)
+
+models_by_k <- setNames(
+  lapply(k_values, function(k) {
+    out <- models_valid
+    out$cluster <- kmeans_results[[paste0("k", k)]]$cluster
+    out$k <- k
+    out
+  }),
+  paste0("k", k_values)
+)
+
+```
+
+## Sensitivity metrics: WSS, silhouette, and bootstrap stability
+
+```{r k_metrics}
+
+cluster_stability_summary <- purrr::map_dfr(k_values, function(k) {
+  
+  cb <- fpc::clusterboot(
+    prediction_matrix,
+    B = 500,
+    bootmethod = "boot",
+    clustermethod = fpc::kmeansCBI,
+    k = k,
+    seed = 42,
+    count = FALSE
+  )
+  
+  tibble(
+    k = k,
+    mean_jaccard_stability = mean(cb$bootmean, na.rm = TRUE),
+    min_jaccard_stability = min(cb$bootmean, na.rm = TRUE)
+  )
+})
+
+k_metrics <- tibble(
+  k = k_values,
+  total_withinss = purrr::map_dbl(kmeans_results, ~ .x$tot.withinss),
+  avg_silhouette = purrr::map2_dbl(
+    kmeans_results,
+    k_values,
+    ~ mean(cluster::silhouette(.x$cluster, dist(prediction_matrix))[, 3])
+  )
+) %>%
+  left_join(cluster_stability_summary, by = "k")
+
+k_metrics
+
+```
+
+```{r wss_plot, fig.height=5, fig.width=5, warning=FALSE}
+
+wss_plot <- ggplot(k_metrics, aes(x = k, y = total_withinss)) +
+  geom_line() +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = k_values) +
+  labs(x = "", y = "Total WSS") +
+  theme_minimal() +
+  theme(axis.title.y = element_text(size = 14))
+
+wss_plot
+
+```
+
+```{r sil_plot, fig.height=5, fig.width=5, warning=FALSE}
+
+silhouette_plot <- ggplot(k_metrics, aes(x = k, y = avg_silhouette)) +
+  geom_line() +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = k_values) +
+  scale_y_continuous(breaks = c(0.4, 0.42, 0.44, 0.46, 0.48)) +
+  labs(x = "Number of clusters (k)",
+       y = "Average silhouette width") +
+  theme_minimal() +
+  theme(axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14))
+
+silhouette_plot
+
+```
+
+```{r jaccard_plot, fig.height=6, fig.width=8, warning=FALSE}
+
+cluster_stability_plot <- ggplot(cluster_stability_summary, aes(x = k)) +
+  geom_line(aes(y = mean_jaccard_stability), linewidth = 1) +
+  geom_point(aes(y = mean_jaccard_stability), size = 3) +
+  geom_line(aes(y = min_jaccard_stability), linetype = "dashed", linewidth = 1) +
+  geom_point(aes(y = min_jaccard_stability), size = 3) +
+  geom_hline(yintercept = 0.75, linetype = "dotted") +
+  geom_hline(yintercept = 0.60, linetype = "dotted") +
+  annotate("text",
+           x = min(cluster_stability_summary$k) - 0.05, y = 0.735,
+           label = "Stable cluster threshold", size = 4.5) +
+  annotate("text",
+           x = min(cluster_stability_summary$k) - 0.05, y = 0.585,
+           label = "Unstable cluster threshold", size = 4.5) +
+  coord_cartesian(xlim = c(3, 6.8)) +
+  labs(x = "", y = "Jaccard stability") +
+#  labs(x = "Number of clusters (k)", y = "Jaccard stability",
+#       title = "Bootstrapped stability of k-means solutions",
+#       subtitle = "Solid = mean cluster stability; dashed = least stable cluster") +
+  theme_minimal() +
+  theme(axis.title.y = element_text(size = 14))
+
+cluster_stability_plot
+
+```
+
+| Jaccard stability | Interpretation                            |
+| ----------------- | ----------------------------------------- |
+| > 0.85            | Highly stable cluster                     |
+| 0.75–0.85         | Stable cluster                            |
+| 0.60–0.75         | Moderately stable cluster                 |
+| < 0.60            | Unstable cluster (often not reproducible) |
+
+```{r supplementary_figure_panel, fig.height=5, fig.width=18, warning=FALSE}
+
+supplementary_panel <- (wss_plot | silhouette_plot | cluster_stability_plot) +
+  plot_layout(widths = c(5, 5, 8)) +
+  plot_annotation(tag_levels = "A") &
+  theme(
+    plot.tag = element_text(size = 20, face = "bold"),
+    plot.tag.position = c(0.02, 0.98)
+  )
+
+supplementary_panel
+ggsave(filename = "FigureSupp_k-clusters_panel.jpeg", plot = supplementary_panel, width = 18, height = 5, dpi = 300)
+
+```
+
+## PCA visualisation of cluster separation
+
+```{r pca_plot, fig.height=8, fig.width=10, warning=FALSE}
+
+cluster_colours <- c("1" = "#eb5b2f", "2" = "#56d627", "3" = "#6ea3f5", "4" = "#e3a53b","5" = "deeppink", "6" = "mediumorchid4")
+
+pca <- prcomp(prediction_matrix, scale. = TRUE)
+
+pca_df <- tibble(
+  cell.id = as.integer(rownames(prediction_matrix)),
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2]
+)
+
+pca_long <- purrr::map_dfr(seq_along(models_by_k), function(i) {
+  model_k <- models_by_k[[i]]
+  k_name <- names(models_by_k)[i]
+  tibble(cell.id = model_k$cell.id,
+         k = stringr::str_replace(k_name, "^k", "k = "),
+         cluster = factor(model_k$cluster))
+}) %>%
+  left_join(pca_df, by = "cell.id")
+
+pca_cluster_plot <- ggplot(pca_long, aes(x = PC1, y = PC2, colour = cluster)) +
+  geom_point(size = 1.2, alpha = 0.8) +
+  stat_ellipse(aes(group = cluster), level = 0.95, linewidth = 0.4) +
+  facet_wrap(~ k) +
+  scale_colour_manual(values = cluster_colours) +
+  labs(x = "PC1", y = "PC2",
+       colour = "Cluster",
+       title = "PCA of predicted wMel trajectories by k-means cluster") +
+  theme_minimal()
+
+pca_cluster_plot
+
+```
+
+## Predicted trajectory plots for each k
+
+```{r tradjectory_plot, fig.height=8, fig.width=10, warning=FALSE}
+
+prediction_long <- as_tibble(prediction_matrix, rownames = "cell.id") %>%
+  mutate(cell.id = as.integer(cell.id)) %>%
+  pivot_longer(
+    cols = -cell.id,
+    names_to = "month_index",
+    values_to = "wmel_pctg"
+  ) %>%
+  group_by(cell.id) %>%
+  mutate(month_of_release = row_number()) %>%
+  ungroup() %>%
+  select(cell.id, month_of_release, wmel_pctg)
+
+trajectory_long_by_k <- map_dfr(k_values, function(k) {
+  prediction_long %>%
+    left_join(
+      models_by_k[[paste0("k", k)]] %>%
+        select(cell.id, cluster),
+      by = "cell.id"
+    ) %>%
+    mutate(
+      k = paste0("k = ", k),
+      cluster = factor(cluster)
+    )
+})
+
+cluster_counts_by_k <- trajectory_long_by_k %>%
+  distinct(k, cell.id, cluster) %>%
+  count(k, cluster, name = "n_cells")
+
+trajectory_plot_by_k <- ggplot(
+  trajectory_long_by_k,
+  aes(x = month_of_release, y = wmel_pctg, group = cell.id, colour = cluster)
+) +
+  geom_line(alpha = 0.4, linewidth = 0.4) +
+  stat_summary(aes(group = cluster), fun = mean, geom = "line", colour = "black", linewidth = 0.6) +
+  facet_grid(k ~ cluster, labeller = labeller(cluster = function(x) paste("Cluster", x))) +
+  scale_colour_manual(values = cluster_colours) +
+  labs(x = "Month of release", y = "Predicted proportion wMel",
+       colour = "Cluster") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        strip.text.x = element_text(size = 14),
+        strip.text.y = element_text(size = 14))
+
+trajectory_plot_by_k
+#ggsave(filename = "FigureSupp_k-trajectory_panel.jpeg", plot = trajectory_plot_by_k, width = 10, height = 8, dpi = 300)
+
+```
+
+```{r tradjectory_maps, fig.height=8, fig.width=10, warning=FALSE}
+
+spatial_base <- readRDS("wmel_with_temp.rds") %>%
+  dplyr::select(cell.id, geometry) %>%
+  st_as_sf()
+
+cluster_df <- purrr::imap_dfr(models_by_k, function(df, name_k) { # flatten list
+  df %>%
+    dplyr::select(cell.id, cluster) %>%
+    mutate(cell.id = as.integer(cell.id),
+           k = name_k,
+           cluster = factor(cluster))
+})
+
+map_data <- spatial_base %>%
+  left_join(cluster_df, by = "cell.id") %>%
+  filter(!is.na(k))
+
+map_by_k_clusters <- ggplot(map_data) +
+  geom_sf(aes(fill = cluster), color = NA) +
+  facet_wrap(~k, ncol = 2) +
+  scale_fill_manual(values = cluster_colours, na.value = "grey85") +
+  theme_minimal() +
+  labs(
+    title = "Spatial distribution of k-means clusters across k values",
+    fill = "Cluster"
+  )
+
+map_by_k_clusters
+
+```
+
+
+Save objects:
+
+```{r save_objects, include=FALSE}
+
+saveRDS(
+  list(models_by_k = models_by_k,
+       kmeans_results = kmeans_results,
+       k_metrics = k_metrics,
+       pca_long = pca_long,
+       trajectory_long_by_k = trajectory_long_by_k),
+  "wmel_kmeans_sensitivity_k3-6.rds"
+)
+
+```
+
+
+## Interpretation
+
+Silhouette: slightly favours k = 3.
+WSS: favours increasing k.
+Ecological trajectory interpretation: favours k = 4.
+Bootstrap stability: k = 3 and k = 4 are both highly stable; k = 5 and 6 are not.
+
+Conclusion:
+Although k = 3 had the highest average silhouette score (0.47), the k = 4 solution was selected because it provided greater ecological resolution of trajectory types while maintaining high cluster stability (mean Jaccard = 0.84; minimum Jaccard = 0.81). In contrast, cluster stability declined substantially for k = 5 and k = 6, with at least one poorly reproducible cluster in each solution (minimum Jaccard = 0.24 and 0.54, respectively). These results indicate that k = 4 achieved a balance between ecological interpretability and statistical robustness.
+
+
+
+
+
+## Reviewer request: Cell assignment changes across k
+
+```{r alluvial_diagram_setup}
+
+cluster_df <- bind_rows(
+  models_by_k$k3,
+  models_by_k$k4,
+  models_by_k$k5,
+  models_by_k$k6
+) %>%
+  dplyr::select(cell.id, k, cluster) %>%
+  mutate(k = paste0("k", k))
+
+cluster_wide <- cluster_df %>%
+  pivot_wider(names_from = k,
+              values_from = cluster)
+
+```
+
+```{r alluvial_diagram, fig.height=8, fig.width=12, warning=FALSE}
+
+alluvial_df <- cluster_wide %>%
+  group_by(k3, k4, k5, k6) %>%
+  summarise(n = n(), .groups = "drop")
+
+alluvial_plot <- ggplot(alluvial_df,
+       aes(axis1 = k3, axis2 = k4, axis3 = k5, axis4 = k6, y = n)) +
+  geom_alluvium(aes(fill = factor(k3)), alpha = 0.5) +
+  geom_stratum(width = 1/5, fill = "white", color = "black") +
+  geom_text(stat = "stratum",
+            aes(label = paste0(after_stat(stratum), "\nn=", after_stat(count))),
+            color = "black", size = 4) +
+  scale_x_discrete(limits = c("k = 3", "k = 4", "k = 5", "k = 6"), expand = c(0.1, 0.1)) +
+  labs(x = "Number of clusters (k)",
+       y = "Number of raster cells (total n = 267)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        strip.text.x = element_text(size = 14),
+        strip.text.y = element_text(size = 14))
+
+alluvial_plot
+#ggsave(filename = "FigureSupp_k-alluvial_panel.jpeg", plot = alluvial_plot, width = 12, height = 8, dpi = 300)
+
+
+```
+
+```{r supplementary_figure_panel2, fig.height=16, fig.width=12, warning=FALSE}
+
+supplementary_panel2 <- (alluvial_plot / trajectory_plot_by_k) +
+  plot_layout(heights = c(8, 8)) +
+  plot_annotation(tag_levels = "A") &
+  theme(
+    plot.tag = element_text(size = 20, face = "bold"),
+    plot.tag.position = c(0.02, 0.98)
+  )
+
+supplementary_panel2
+ggsave(filename = "FigureSupp_k-alluvial_trajectories_panel.jpeg", plot = supplementary_panel2, width = 12, height = 16, dpi = 300)
+
+```
+
+#### Cell assignment values
+
+```{r cell_assignment}
+
+cluster_assignments <- purrr::map_dfr(c(3, 4, 5), function(k) {
+  models_by_k[[paste0("k", k)]] %>%
+    dplyr::select(cell.id, cluster) %>%
+    mutate(k = paste0("k", k))
+}) %>%
+  tidyr::pivot_wider(
+    names_from = k,
+    values_from = cluster
+  )
+
+```
+
+```{r cell_assignment_34}
+
+table_k3_k4 <- table(cluster_assignments$k3, cluster_assignments$k4)
+prop_k3_k4_tbl <- prop.table(table_k3_k4, margin = 1) * 100
+prop_k3_k4_tbl <- as.data.frame(prop_k3_k4_tbl) %>%
+  dplyr::rename(
+    k3_cluster = Var1,
+    k4_cluster = Var2,
+    percent = Freq
+  ) %>%
+  dplyr::mutate(percent = round(percent, 1)) %>%
+  tidyr::pivot_wider(
+    names_from = k4_cluster,
+    values_from = percent,
+    names_prefix = "k4_pctg_cluster_"
+  ) %>%
+  tibble::as_tibble()
+
+cat("\n\n## For each k=3 cluster, where do its cells go under k=4? (% per k3 cluster)\n")
+prop_k3_k4_tbl
+
+cat("\n\n## Mean cell retention between k = 3 and k = 4\n")
+mean_retention_k3_k4 <- prop_k3_k4_tbl %>%
+  dplyr::select(-k3_cluster) %>%
+  apply(1, max) %>%
+  mean()
+mean_retention_k3_k4
+
+```
+
+```{r cell_assignment_45}
+
+table_k4_k5 <- table(cluster_assignments$k4, cluster_assignments$k5)
+prop_k4_k5_tbl <- prop.table(table_k4_k5, margin = 1) * 100
+prop_k4_k5_tbl <- as.data.frame(prop_k4_k5_tbl) %>%
+  dplyr::rename(
+    k4_cluster = Var1,
+    k5_cluster = Var2,
+    percent = Freq
+  ) %>%
+  dplyr::mutate(percent = round(percent, 1)) %>%
+  tidyr::pivot_wider(
+    names_from = k5_cluster,
+    values_from = percent,
+    names_prefix = "k5_pctg_cluster_"
+  ) %>%
+  tibble::as_tibble()
+
+cat("\n\n## For each k=4 cluster, where do its cells go under k=5? (% per k4 cluster)\n")
+prop_k4_k5_tbl
+
+cat("\n\n## Mean cell retention between k = 4 and k = 5\n")
+mean_retention_k4_k5 <- prop_k4_k5_tbl %>%
+  dplyr::select(-k4_cluster) %>%
+  apply(1, max) %>%
+  mean()
+mean_retention_k4_k5
+
+```
+
+Interpretation:
+Going from k = 3 → k = 4, clusters 1 and 2 are largely preserved, but cluster 3 splits almost exactly 50:50 into two new groups.
+Going from k = 4 → k = 5, clusters 1, 3 and 4 are highly stable (>90% retained in a single k=5 cluster), while cluster 2 is split into two substantial subgroups (44% and 54%).
+
+Combined with the high bootstrapped stability of the k = 4 solution (mean Jaccard = 0.84), this supports k = 4 as a parsimonious balance between ecological resolution and cluster robustness.
+

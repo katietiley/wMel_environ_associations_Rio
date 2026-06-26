@@ -1,0 +1,633 @@
+---
+title: "mulitnomial_gam_sensitivity_building_height_definition"
+author: "K Tiley"
+date: "2026-06-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(dplyr)            # pipelines
+library(tidyr)            # dataframe manipulation
+library(reshape2)         # dataframe manipulation
+library(forcats)          # fct_recode()
+library(nnet)             # multinomial logistic regression
+library(mgcv)             # GAMs
+library(caret)            # regression
+library(ggplot2)          # plotting
+library(sf)               # spatial data
+library(spatialsample)    # spatial cross-validation
+library(spdep)            # spatial autocorrelation
+library(car)              # multicollinearity
+library(purrr)            # iteration (map_* etc.)
+library(rlang)
+library(tibble)
+library(stringr)
+library(ggbeeswarm)
+library(terra)
+library(exactextractr)
+
+```
+
+
+## Prepare data
+
+```{r predictor_data_prep}
+
+# upload predictors
+predictors_df <- read.csv("model_predictors_df_updatedflightbarriers2025-09-30.csv", header = TRUE)
+
+# sensitivity analysis: calculate 15 m tall-building predictor directly
+
+wmel_rio <- read.csv("data_wmel_rio.csv")
+
+wmel_rio_releases <- wmel_rio %>%
+  filter(t >= 92) %>%
+  mutate(date = as.Date(month))
+
+wmel_points <- st_as_sf(
+  wmel_rio_releases,
+  coords = c("x", "y"),
+  crs = 32723
+)
+
+make_square <- function(pt, size) {
+  xy <- st_coordinates(pt)
+  h <- size / 2
+  
+  st_polygon(list(matrix(c(
+    xy[1] - h, xy[2] - h,
+    xy[1] + h, xy[2] - h,
+    xy[1] + h, xy[2] + h,
+    xy[1] - h, xy[2] + h,
+    xy[1] - h, xy[2] - h
+  ), ncol = 2, byrow = TRUE)))
+}
+
+make_square_sf <- function(sf_points, size) {
+  st_sf(
+    sf_points,
+    geometry = st_sfc(
+      lapply(st_geometry(sf_points), make_square, size = size),
+      crs = st_crs(sf_points)
+    )
+  )
+}
+
+# 500 m cells
+wmel_cells <- make_square_sf(wmel_points, size = 500)
+
+unique_wmel_cells <- wmel_cells %>%
+  select(cell.id) %>%
+  distinct()
+
+# 700 m buffers
+flight_buffers <- make_square_sf(wmel_points, size = 700)
+
+unique_flight_buffers <- flight_buffers %>%
+  transmute(cell.id, geometry) %>%
+  distinct()
+
+buffer_intersection_same_cell <- st_intersection(
+  unique_flight_buffers %>% rename(cell.id_flight = cell.id),
+  unique_wmel_cells
+) %>%
+  filter(cell.id_flight == cell.id)
+
+hollow_flight_buffers <- unique_flight_buffers %>%
+  rename(cell.id_flight = cell.id) %>%
+  st_difference(buffer_intersection_same_cell) %>%
+  filter(cell.id_flight == cell.id) %>%
+  transmute(cell.id = cell.id_flight, geometry) %>%
+  st_make_valid()
+
+# Extract GHSL building-height class areas for cells + hollow flight buffers
+built_characteristics <- terra::rast("GHS_BUILT_C_2018_rio_buffer1km_ESRI54009_10m.tif")
+built_characteristics <- terra::classify(built_characteristics, rbind(c(255, NA)))
+weights <- terra::cellSize(built_characteristics, unit = "m")
+
+extract_class_areas <- function(polys) {
+  polys_transformed <- st_transform(polys, terra::crs(built_characteristics))
+  
+  class_area_list <- exactextractr::exact_extract(
+    built_characteristics,
+    polys_transformed,
+    fun = function(values, coverage_fraction, weights) {
+      tapply(coverage_fraction * weights, values, sum, na.rm = TRUE)
+    },
+    weights = weights,
+    progress = TRUE
+  )
+  
+  bind_rows(
+    lapply(class_area_list, function(x) if (is.null(x)) NULL else as.list(x)),
+    .id = "cell.id"
+  ) %>%
+    mutate(cell.id = as.integer(cell.id)) %>%
+    mutate(across(-cell.id, ~ suppressWarnings(as.numeric(.)))) %>%
+    mutate(across(-cell.id, ~ tidyr::replace_na(., 0)))
+}
+
+class_areas_cells <- extract_class_areas(unique_wmel_cells)
+class_areas_buffers <- extract_class_areas(hollow_flight_buffers)
+
+class_areas_total <- bind_rows(class_areas_cells, class_areas_buffers) %>%
+  group_by(cell.id) %>%
+  summarise(across(where(is.numeric), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+
+class_cols <- names(class_areas_total) != "cell.id"
+class_areas_sum <- rowSums(class_areas_total[, class_cols], na.rm = TRUE)
+
+built_characteristics_proportions <- sweep(
+  class_areas_total[, class_cols],
+  1,
+  class_areas_sum,
+  `/`
+)
+
+name_map <- c(
+  "0"  = "GHSL0_unclassified",
+  "1"  = "GHSL1_open_low_veg",
+  "2"  = "GHSL2_open_med_veg",
+  "3"  = "GHSL3_open_high_veg",
+  "4"  = "GHSL4_open_water",
+  "5"  = "GHSL5_open_road",
+  "11" = "GHSL11_built_res_3m",
+  "12" = "GHSL12_built_res_6m",
+  "13" = "GHSL13_built_res_15m",
+  "14" = "GHSL14_built_res_30m",
+  "15" = "GHSL15_built_res_30m_plus",
+  "21" = "GHSL21_built_nonres_3m",
+  "22" = "GHSL22_built_nonres_6m",
+  "23" = "GHSL23_built_nonres_15m",
+  "24" = "GHSL24_built_nonres_30m",
+  "25" = "GHSL25_built_nonres_30m_plus"
+)
+
+colnames(built_characteristics_proportions) <-
+  name_map[colnames(built_characteristics_proportions)]
+
+built_characteristics_proportions$cell.id <- class_areas_total$cell.id
+
+tall_cols_15plus <- c(
+  "GHSL14_built_res_30m",
+  "GHSL15_built_res_30m_plus",
+  "GHSL24_built_nonres_30m",
+  "GHSL25_built_nonres_30m_plus"
+)
+
+building_height_values15 <- built_characteristics_proportions %>%
+  transmute(
+    cell.id,
+    proportion_buildings_over15m = rowSums(across(any_of(tall_cols_15plus)), na.rm = TRUE)
+  )
+
+# Replace original 6 m predictor with 15 m sensitivity predictor
+predictors_df <- predictors_df %>%
+  select(-proportion_buildings_over6m) %>%
+  left_join(building_height_values15, by = "cell.id")
+
+#names(predictors_df)
+
+```
+
+```{r outcome_data_prep}
+
+# upload outcome trajectories
+wmel_reassigned <- read.csv("k4_reassigned_wmel_all_2025-09-24.csv", header = TRUE)  # outcome with reassignment for decreasing slopes
+
+# prepare model dataframes
+wmel_clustered_num <- wmel_reassigned %>%
+  filter(!is.na(cluster)) %>%                                                                               # remove rows where cluster is NA
+  mutate(cluster = factor(cluster, levels = c("Unsuccessful","Low Success","Moderate Success","High Success")),
+         cluster_num = dplyr::recode(as.character(cluster), "Unsuccessful" = 3L, "Low Success" = 4L, "Moderate Success" = 2L, "High Success" = 1L,
+                                     .default = NA_integer_, .missing = NA_integer_),
+         release_zone = factor(release_zone)) %>%
+  distinct(cell.id, .keep_all = TRUE) %>%                                                                   # retain one row (and cluster label) per cell.id
+  dplyr::select(cell.id, cluster, cluster_num, x, y, release_zone)
+
+wmel_model_df <- wmel_clustered_num %>%
+  dplyr::select(cell.id, cluster, release_zone) %>%
+  left_join(predictors_df, by = "cell.id") %>%
+  mutate(across(
+    .cols = -c(cell.id, cluster, release_zone),
+    .fns = ~ replace_na(., 0)
+    ),
+    release_zone5 = release_zone,
+    release_zone = case_when(
+      release_zone5 %in% c("RJ3.1", "RJ3.2", "RJ3.3") ~ "RJ3",
+      release_zone5 == "RJ2" ~ "RJ2",
+      TRUE ~ "RJ1"
+    ),
+    release_zone = factor(release_zone)
+  )
+
+# predictor pool (exclude id, response, coords)
+predictors_og <- setdiff(
+  names(wmel_model_df),
+  c("cell.id", "cluster", "neighbouring_wmel_pctg_mean_avg", "release_zone", "release_zone5")
+)
+
+```
+
+
+## Check baseline spatial autocorrelation
+
+Monte Carlo join-count test (for categorical variables, Moran's I is for continuous variables)
+    Significant positive joins = same-cluster neighbours greater than expected under randomness = spatial clustering of the outcome
+
+Note: using points instead of polygons is acceptable in this case as I set neighbour distance at 800m. For 500 x 500 m raster cells the distance to rook neighbours = 500m and queen neighbours = ~707m
+
+```{r spatial_autocorrelation, warning=FALSE}
+
+wmel_clustered_sf <- st_as_sf(wmel_clustered_num, coords = c("x", "y"), crs = 32723)                      # add geometries
+#plot(st_geometry(wmel_clustered_sf), col = 'grey70')                                                      # sanity check:- geometries look ok
+coords <- st_coordinates(wmel_clustered_sf)                                                               # get coords for spatial weighting
+nb <- dnearneigh(coords, d1 = 0, d2 = 800)                                                                # distance-based neighbours: within 800 m
+nb_k1 <- knn2nb(knearneigh(coords, k = 1))                                                                # list of neighbours number
+nb_fix <- union.nb(nb, nb_k1)                                                                            # add one nearest-neighbour to any 'islands' (isolated cells)
+cat("sanity check:- no zeros:\n")
+table(card(nb_fix))
+lw <- nb2listw(nb_fix, style = "W")                                                                       # build spatial weights
+set.seed(1)
+pvals <- c(                                                                                                # extracted p-value for TRUE (within specified cluster)
+  joincount.mc(factor(wmel_clustered_sf$cluster %in% "Unsuccessful"), lw, nsim=999)[[2]]$p.value,
+  joincount.mc(factor(wmel_clustered_sf$cluster %in% "Low Success"), lw, nsim=999)[[2]]$p.value,
+  joincount.mc(factor(wmel_clustered_sf$cluster %in% "Moderate Success"), lw, nsim=999)[[2]]$p.value,
+  joincount.mc(factor(wmel_clustered_sf$cluster %in% "High Success"), lw, nsim=999)[[2]]$p.value)
+pvals_FDR <- p.adjust(pvals, "fdr")                                                                       # adjusted for False Discovery Rate (since doing multiple tests)
+cat("\nFDR-adjusted join-count test p-values:\n")
+print(pvals_FDR)
+
+```
+Statistical significance indicates strong spatial autocorrelation and justifies a smoothed spatial term.
+
+
+## Predictor selection
+
+#### a) Check for zero variance
+
+```{r pred_variance}
+
+nzv_vars <- nearZeroVar(wmel_model_df[, predictors_og], saveMetrics = TRUE) %>% filter(nzv == TRUE)
+print(nzv_vars)
+
+```
+
+```{r pred_variance_refine}
+
+# REMOVE zero variance predictors
+nzv_vars_remove <- nzv_vars %>%
+  filter(nzv == TRUE) %>%
+  rownames()
+predictors_clean1 <- setdiff(predictors_og, nzv_vars_remove)
+
+```
+
+#### b) Check for multicollinearity
+
+```{r pred_multicollinearity}
+
+cor_matrix <- cor(wmel_model_df[, predictors_clean1], use = "pairwise.complete.obs")
+cor_matrix[upper.tri(cor_matrix, diag = TRUE)] <- NA                                                      # exclude diagonal and duplicates
+cor_long <- as.data.frame(as.table(cor_matrix)) %>%                                                       # convert to long for easier filtering
+  filter(!is.na(Freq)) %>%
+  arrange(desc(abs(Freq)))
+high_corr_pairs <- cor_long %>% filter(abs(Freq) > 0.8)                                                   # show pairs with |correlation| > 0.8
+high_corr_pairs
+
+```
+
+```{r pred_multicollinearity_refine}
+
+# REMOVE collinear predictors based on keeping most biologically important per pair
+drops <- c("average_literacy","humidity_mean_idw")
+predictors_clean2 <- setdiff(predictors_clean1, drops)
+
+```
+
+```{r pred_multicollinearity_plot, fig.height=8, fig.width=10, warning=FALSE}
+
+cor_matrix_drops <- cor(wmel_model_df[, predictors_clean2], use = "pairwise.complete.obs")
+cor_matrix_drops[upper.tri(cor_matrix_drops, diag = TRUE)] <- NA                                          # exclude diagonal and duplicates
+cor_melt <- melt(cor_matrix_drops, varnames = c("Var1", "Var2"))                                           # melt to long format
+cor_melt <- cor_melt %>%
+  mutate(label = ifelse(abs(value) >= 0.3, round(value, 2), ""))                                            # create column for labels where absolute value >= 0.6
+corr_plot <- ggplot(cor_melt, aes(Var1, Var2, fill = value)) +                                              # plot corrplot with labelled correlation coefficients
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab") +
+  geom_text(aes(label = label), color = "black", size = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  coord_fixed() +
+  ggtitle("Correlation Matrix (Labels > |0.3|)")
+corr_plot
+
+```
+
+#### c) Check for high Variance Inflation Factors (VIF)
+
+As a rule of thumb:
+-  <5 low, 5-10 moderate
+-  >10 high multicollinearity & consider removing or combining
+-  >30 severe multicollinearity & must address as model is not valid
+
+```{r pred_vif}
+
+lm_vif_test <- lm(as.numeric(cluster) ~ ., data = wmel_model_df[, c("cluster", predictors_clean2)])
+vif_values <- car::vif(lm_vif_test)
+vif_values
+
+```
+
+Problem: proportion_residential & proportion_non_residential
+Resolution: 'residualise' proportion_non_residential so that the non-residential buffer effect is retained without the non-residential data trends explained by proportion_residential
+How: fit a model to get residuals, but which model? -> lm preferred unless curvature then gam needed
+
+```{r tester}
+
+# a) visually curves away from the line, indicates non-linear
+ggplot(wmel_model_df, aes(x = proportion_residential, y = proportion_non_residential)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", se = FALSE, linetype = 2, linewidth = 0.8, color = "black") +
+  geom_smooth(method = mgcv::gam, formula = y ~ s(x, k = 6), se = FALSE, linewidth = 1)
+# b) the proportion_residential smooth term is significantly better than the linear predictor, indicates non-linear
+m_lin <- gam(proportion_non_residential ~ proportion_residential, data = wmel_model_df, method = "ML")
+m_spl <- gam(proportion_non_residential ~ s(proportion_residential, k = 10), data = wmel_model_df, method = "ML")
+AIC(m_lin,m_spl)
+# c) edf greater than 1 indicates non-linear, non-significant p-value indicates k isn't too small
+gam.check(m_spl)
+
+
+```
+
+Evidence of non-linearity, so fit a GAM.
+
+```{r pred_vif_refine}
+
+# how: fit a quick model to get residuals -> gam
+aux <- mgcv::gam(proportion_non_residential ~ s(proportion_residential, k = 6), data = wmel_model_df, method = "REML")
+wmel_model_df$proportion_non_residential <- resid(aux)
+# problem resolved in vif?
+lm_vif_test <- lm(as.numeric(cluster) ~ ., data = wmel_model_df[, c("cluster", predictors_clean2)])
+vif_values <- car::vif(lm_vif_test)
+vif_values
+
+```
+
+
+## Scale predictors
+
+Scale predictors for comparable coefficients which tell you the expected change in log-odds per 1 SD increase in the predictor. Method: subtract predictor mean and divide by SD.
+
+```{r pred_scaled}
+
+wmel_model_df_scaled <- wmel_model_df[, c(predictors_clean2, "cell.id", "cluster", "release_zone", "neighbouring_wmel_pctg_mean_avg")] %>%
+  mutate(across(all_of(predictors_clean2), ~ as.numeric(scale(.x))))
+#summary(wmel_model_df_scaled)
+
+```
+
+
+## Model screening
+
+```{r screening_df}
+
+# final model dataframe
+wmel_model_df_scaled_subset <- wmel_model_df_scaled %>%
+  dplyr::select(any_of(c(predictors_clean2, "cluster", "release_zone", "neighbouring_wmel_pctg_mean_avg")))
+df <- droplevels(wmel_model_df_scaled_subset)
+
+df$cluster <- relevel(df$cluster, ref = "Unsuccessful")
+df$cluster_code <- as.numeric(df$cluster) - 1L                                                            # recode response to integers 0..K with desired baseline as 0
+K <- max(df$cluster_code)
+f_list0 <- list(cluster_code ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone), ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone), ~s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone))
+m0 <- gam(f_list0, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)  # intercept-only reference model
+aic_base <- AIC(m0)
+
+```
+
+```{r screening_helpers}
+
+build_flist_linear <- function(
+    rhs, K, resp = "cluster_code",
+    k = 10, bs = "ts"
+    ){
+
+  # rhs  = RHS formula like ~ x1 + x2 + x3
+  # K    = number of classes
+  # resp = response variable name
+  # k    = default basis size (scalar, default 10) OR a *named* numeric vec per var
+  # bs   = basis for s(), default "ts" (thin-plate w/ shrinkage)
+  
+  stopifnot(inherits(rhs, "formula"), K >= 2)
+  
+  term_labels <- xfun::attr2(terms(rhs), "term.labels")
+  
+  pick_k <- function(v) {
+    if (length(k) > 1 && !is.null(names(k)) && v %in% names(k)) k[[v]] else as.numeric(k)[1]
+  }
+  
+  # always add the spatial proxy smooth
+#  spatial_proxy <- "s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10)"
+#  spatial_proxy <- "s(release_zone, bs='re')"
+  spatial_proxy <- "s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone)"
+
+
+  # assemble RHS (deduplicate, preserve first occurrence)
+  rhs_terms <- unique(c(term_labels, spatial_proxy))
+  rhs_new   <- as.formula(paste("~", paste(rhs_terms, collapse = " + ")))
+  
+  # mgcv multinomial formula list: first has response, rest are RHS
+  c(list(update(rhs_new, paste(resp, "~ ."))),
+    rep(list(rhs_new), K - 1))
+}
+
+```
+
+
+## Forward selection by AIC |>2|
+
+```{r forward_selection_1}
+
+univariate_tbl_1 <- lapply(predictors_clean2, function(x){
+  f1 <- as.formula(paste("~", x))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_1)
+choose1 <- if (univariate_tbl_1$dAIC[1] < -2) univariate_tbl_1$term[1] else NULL
+predictors_1 <- if (is.null(choose1)) stop("STOP, no new predictor chosen") else setdiff(predictors_clean2, choose1)
+
+```
+
+```{r forward_selection_2}
+
+base_rhs_1 <- as.formula(paste("~", choose1))
+base_flist_1 <- build_flist_linear(base_rhs_1, K)
+aic_base_1 <- AIC(mgcv::gam(base_flist_1, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude))
+
+univariate_tbl_2 <- lapply(predictors_1, function(x){
+  f1 <- update(base_rhs_1, as.formula(paste("~ . +", x)))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base_1)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_2)
+choose2 <- if (univariate_tbl_2$dAIC[1] < -2) univariate_tbl_2$term[1] else NULL
+predictors_2 <- if (is.null(choose2)) stop("STOP, no new predictor chosen") else setdiff(predictors_1, choose2)
+
+```
+
+```{r forward_selection_3}
+
+base_rhs_2 <- update(base_rhs_1, as.formula(paste("~ . +", choose2)))
+base_flist_2 <- build_flist_linear(base_rhs_2, K)
+aic_base_2 <- AIC(mgcv::gam(base_flist_2, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude))
+
+univariate_tbl_3 <- lapply(predictors_2, function(x){
+  f1 <- update(base_rhs_2, as.formula(paste("~ . +", x)))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base_2)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_3)
+choose3 <- if (univariate_tbl_3$dAIC[1] < -2) univariate_tbl_3$term[1] else NULL
+predictors_3 <- if (is.null(choose3)) stop("STOP, no new predictor chosen") else setdiff(predictors_2, choose3)
+
+```
+
+```{r forward_selection_4}
+
+base_rhs_3 <- update(base_rhs_2, as.formula(paste("~ . +", choose3)))
+base_flist_3 <- build_flist_linear(base_rhs_3, K)
+aic_base_3 <- AIC(mgcv::gam(base_flist_3, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude))
+
+univariate_tbl_4 <- lapply(predictors_3, function(x){
+  f1 <- update(base_rhs_3, as.formula(paste("~ . +", x)))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base_3)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_4)
+choose4 <- if (univariate_tbl_4$dAIC[1] < -2) univariate_tbl_4$term[1] else NULL
+predictors_4 <- if (is.null(choose4)) stop("STOP, no new predictor chosen") else setdiff(predictors_3, choose4)
+
+```
+
+```{r forward_selection_5}
+
+base_rhs_4 <- update(base_rhs_3, as.formula(paste("~ . +", choose4)))
+base_flist_4 <- build_flist_linear(base_rhs_4, K)
+aic_base_4 <- AIC(mgcv::gam(base_flist_4, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude))
+
+univariate_tbl_5 <- lapply(predictors_4, function(x){
+  f1 <- update(base_rhs_4, as.formula(paste("~ . +", x)))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base_4)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_5)
+choose5 <- if (univariate_tbl_5$dAIC[1] < -2) univariate_tbl_5$term[1] else NULL
+predictors_5 <- if (is.null(choose5)) stop("STOP, no new predictor chosen") else setdiff(predictors_4, choose5)
+
+```
+
+```{r forward_selection_6}
+
+base_rhs_5 <- update(base_rhs_4, as.formula(paste("~ . +", choose5)))
+base_flist_5 <- build_flist_linear(base_rhs_5, K)
+aic_base_5 <- AIC(mgcv::gam(base_flist_5, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude))
+
+univariate_tbl_6 <- lapply(predictors_5, function(x){
+  f1 <- update(base_rhs_5, as.formula(paste("~ . +", x)))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base_5)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_6)
+choose6 <- if (univariate_tbl_6$dAIC[1] < -2) univariate_tbl_6$term[1] else NULL # "average_household_income"
+predictors_6 <- if (is.null(choose6)) stop("STOP, no new predictor chosen") else setdiff(predictors_5, choose6)
+
+```
+
+
+## Selected model
+
+```{r best_model}
+
+best_rhs <- base_rhs_5
+best_flist <- build_flist_linear(best_rhs, K)
+best_model <- mgcv::gam(best_flist, data = df, family = mgcv::multinom(K = K), method = "REML", select = TRUE, na.action = na.exclude)
+print(summary(best_model))
+
+cat("\nBest_model AIC:\n")
+print(AIC(best_model))
+
+```
+
+95%CIs from model summary SE:
+```{r model_95pct_CI}
+
+# extract parametric coefficient table
+coef_summary <- summary(best_model) # model summary
+coef_betas <- coef_summary$p.coeff # just betas
+coef_SEs <- coef_summary$se # just standard errors
+param_SEs <- coef_SEs[names(coef_SEs) %in% names(coef_betas)] # keep only SE values with names matching the parametric coefficient names (not spatial smooths)
+coef_ps <- coef_summary$p.pv # just p-values
+# 95% CI using normal approximation
+zcrit <- qnorm(1 - 0.05/2)  # 1.96 for 95% CI
+# make summary table with 95%CI
+coef_tab_ci <- cbind(
+  coef_betas,
+  param_SEs,
+  CI_lower = coef_betas - zcrit * param_SEs,
+  CI_upper = coef_betas + zcrit * param_SEs,
+  coef_ps
+)
+coef_tab_ci
+
+```
+
+#### Confusion martrix
+
+Confusion matrix: observed vs predicted clusters
+```{r confusion_matrix}
+
+levs <- levels(wmel_model_df_scaled$cluster)                                                              # assign levels
+predicted_probs <- predict(best_model, type = "response")                                                  # calculate residuals per cluster
+colnames(predicted_probs) <- levs                                                                         # assign colnames
+predicted_class <- factor(colnames(predicted_probs)[max.col(predicted_probs, ties.method = "first")], levels = levs)  # predicted clusters
+observed_class <- factor(wmel_model_df_scaled$cluster, levels = levs)                                    # observed clusters
+confusion_matrix <- caret::confusionMatrix(predicted_class, observed_class)
+confusion_matrix
+
+```
+
+
+#### Spatial autocorrelation of model residuals
+
+```{r spatial_autocorrelation_residuals}
+
+# model residuals spatial autocorrelation
+set.seed(1)
+for (k in levs) {                                                                                          # Moran's I test
+  r_k <- as.numeric(wmel_model_df_scaled$cluster == k) - predicted_probs[,k]
+  # keep only rows with finite residuals
+  ok <- is.finite(r_k)
+  if (sum(ok) < 3) {
+    cat("\nMoran's I for class:", k, " — skipped (<3 obs after NA removal)\n")
+    next
+  }
+  # subset weights to the same indices
+  r_use  <- r_k[ok]
+  lw_use <- spdep::subset.listw(lw, ok)
+  # calculate Moran's I
+  cat("\nMoran’s I for class:", k, "\n")
+  print(moran.mc(r_use, lw_use, nsim = 999))
+}
+
+```
+

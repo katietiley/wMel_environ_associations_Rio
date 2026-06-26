@@ -1,0 +1,1377 @@
+---
+title: "model_predictors"
+author: "K Tiley"
+date: "2026-06-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(terra)
+library(sf)
+library(osmdata)
+library(exactextractr)
+library(purrr)
+library(lubridate)
+library(stringr)
+library(gstat)
+
+```
+
+
+## Helper functions
+
+```{r helper_func}
+
+make_square <- function(pt, size) {
+  xy <- st_coordinates(pt)
+  h <- size / 2
+  
+  st_polygon(list(matrix(c(
+    xy[1] - h, xy[2] - h,
+    xy[1] + h, xy[2] - h,
+    xy[1] + h, xy[2] + h,
+    xy[1] - h, xy[2] + h,
+    xy[1] - h, xy[2] - h
+  ), ncol = 2, byrow = TRUE)))
+}
+
+make_square_sf <- function(sf_points, size) {
+  st_sf(
+    sf_points,
+    geometry = st_sfc(
+      lapply(st_geometry(sf_points), make_square, size = size),
+      crs = st_crs(sf_points)
+    )
+  )
+}
+
+```
+
+
+## Wolbachia raster cells and flight buffers
+
+```{r wmel_cells, warning=FALSE}
+
+wmel_rio <- read.csv("data_wmel_rio.csv")
+
+wmel_rio_releases <- wmel_rio %>%
+  filter(t >= 92) %>%
+  mutate(
+    date = as.Date(month),
+    year = as.integer(format(date, "%Y")),
+    month = as.integer(format(date, "%m"))
+  )
+
+wmel_rio_releases_sf_xy <- st_as_sf(
+  wmel_rio_releases,
+  coords = c("x", "y"),
+  crs = 32723
+)
+
+# 500 × 500 m raster cells
+wmel_rio_releases_sf_xy_buffer <- make_square_sf(wmel_rio_releases_sf_xy, size = 500)
+
+# Kept for compatibility with later object names
+wmel_rio_releases_sf_xy_buffer_master <- wmel_rio_releases_sf_xy_buffer
+
+unique_wmel_cells <- wmel_rio_releases_sf_xy_buffer_master %>%
+  select(cell.id) %>%
+  distinct()
+
+# 700 × 700 m buffers around cell centroids
+wmel_rio_releases_sf_xy_flight_buffer <- make_square_sf(wmel_rio_releases_sf_xy, size = 700)
+
+unique_flight_buffer <- wmel_rio_releases_sf_xy_flight_buffer %>%
+  transmute(cell.id_flight = cell.id, geometry) %>%
+  distinct()
+
+# Remove the central 500 m cell from each 700 m buffer to create hollow flight buffers
+buffer_intersection_same_cell <- st_intersection(
+  unique_flight_buffer,
+  unique_wmel_cells
+) %>%
+  filter(cell.id_flight == cell.id)
+
+hollow_flight_buffers <- unique_flight_buffer %>%
+  st_difference(buffer_intersection_same_cell) %>%
+  filter(cell.id_flight == cell.id) %>%
+  transmute(cell.id = cell.id_flight, geometry) %>%
+  st_make_valid()
+
+```
+
+## Neighbouring %wMel
+
+```{r neighbouring_wmel, warning=FALSE}
+
+hollow_flight_buffers_aegypti <- st_transform(
+  hollow_flight_buffers,
+  st_crs(wmel_rio_releases_sf_xy_buffer_master)
+)
+
+cell_areas <- wmel_rio_releases_sf_xy_buffer %>%
+  mutate(area_cell = as.numeric(st_area(geometry))) %>%
+  st_drop_geometry() %>%
+  distinct(cell.id, area_cell)
+
+intersection_sf <- st_intersection(
+  hollow_flight_buffers_aegypti %>%
+    transmute(cell.id_flight = cell.id, geometry),
+  wmel_rio_releases_sf_xy_buffer %>%
+    select(cell.id, year, month, wmel_pctg)
+) %>%
+  mutate(area_intersection = as.numeric(st_area(geometry))) %>%
+  left_join(cell_areas, by = "cell.id") %>%
+  mutate(
+    weight = area_intersection / area_cell,
+    weighted_wmel_pctg = wmel_pctg * weight
+  )
+
+neighbouring_wmel_values <- intersection_sf %>%
+  st_drop_geometry() %>%
+  group_by(cell.id_flight, year, month) %>%
+  summarise(
+    neighbouring_wmel_pctg_mean =
+      sum(weighted_wmel_pctg, na.rm = TRUE) / sum(weight, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(cell.id = cell.id_flight)
+
+average_neighbouring_wmel_values <- neighbouring_wmel_values %>%
+  group_by(cell.id) %>%
+  summarise(
+    neighbouring_wmel_pctg_mean_avg =
+      mean(neighbouring_wmel_pctg_mean, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+## Water tank density
+Source: Steffen Knoblauch
+
+```{r water_tank_density, warning=FALSE}
+
+water_tank <- terra::rast("water_tank_density.tif")
+
+water_tank_values <- unique_wmel_cells %>%
+  st_transform(terra::crs(water_tank)) %>%
+  select(cell.id) %>%
+  mutate(
+    water_tank_density = exactextractr::exact_extract(
+      water_tank,
+      .,
+      fun = "mean"
+    )
+  ) %>%
+  st_drop_geometry()
+
+```
+
+## Breeding container count
+Source: Steffen Knoblauch
+Final selected definition from 'model_predictors_breeding_container_definitions.Rmd': potted plants + storm drains with grids + water tanks
+
+```{r breeding_container_count, warning=FALSE}
+
+breeding_container_types <- st_read("GSV_container_counts.json", quiet = TRUE) %>%
+  st_transform(32723)
+
+breeding_container_types_values <- unique_wmel_cells %>%
+  st_transform(st_crs(breeding_container_types)) %>%
+  select(cell.id) %>%
+  st_join(breeding_container_types) %>%
+  st_drop_geometry() %>%
+  group_by(cell.id) %>%
+  summarise(
+    across(where(is.numeric), ~ sum(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+breeding_containers_values <- breeding_container_types_values %>%
+  select(cell.id, potted_plant, storm_drain_with_grid, water_tank) %>%
+  mutate(
+    breeding_container_sum = rowSums(
+      across(c(potted_plant, storm_drain_with_grid, water_tank)),
+      na.rm = TRUE
+    )
+  ) %>%
+  select(cell.id, breeding_container_sum)
+
+```
+
+## Census data
+Source: Brazil Census 2022 https://ftp.ibge.gov.br/Censos/Censo_Demografico_2022/
+Source household income: https://ftp.ibge.gov.br/Censos/Censo_Demografico_2022/Agregados_por_Setores_Censitarios_Rendimento_do_Responsavel/
+
+```{r census_data, warning=FALSE}
+
+dados_basico <- read_delim(
+  "Census2022/Agregados_por_setores_basico_BR_20250417.csv",
+  delim = ";",
+  locale = locale(encoding = "ISO-8859-1", decimal_mark = ",")
+)
+
+domicilio2 <- read_delim(
+  "Census2022/Agregados_por_setores_caracteristicas_domicilio2_BR_20250417.csv",
+  delim = ";",
+  locale = locale(encoding = "ISO-8859-1", decimal_mark = ",")
+)
+
+alfabetizacao <- read_delim(
+  "Census2022/Agregados_por_setores_alfabetizacao_BR.csv",
+  delim = ";",
+  locale = locale(encoding = "ISO-8859-1", decimal_mark = ",")
+)
+
+renda_bairro <- read_delim(
+  "Census2022/Agregados_por_bairros_renda_responsavel_BR.csv",
+  delim = ";",
+  locale = locale(encoding = "ISO-8859-1", decimal_mark = ",")
+)
+
+setores <- st_read("Census2022/RJ_setores_CD2022.gpkg", quiet = TRUE) %>%
+  st_make_valid() %>%
+  select(CD_SETOR)
+
+unique_wmel_cells_setores <- unique_wmel_cells %>%
+  st_transform(st_crs(setores))
+
+bairros <- st_read("Census2022/RJ_bairros_CD2022.gpkg", quiet = TRUE) %>%
+  st_make_valid() %>%
+  select(CD_BAIRRO)
+
+unique_wmel_cells_bairros <- unique_wmel_cells %>%
+  st_transform(st_crs(bairros))
+
+```
+
+#### Household waste collection
+
+```{r household_waste, warning=FALSE}
+
+waste_cols_yes <- c("V00397", "V00398")
+waste_cols_no <- c("V00399", "V00400", "V00401", "V00402")
+waste_cols <- intersect(c(waste_cols_yes, waste_cols_no), names(domicilio2))
+
+hh_waste <- domicilio2 %>%
+  mutate(
+    CD_SETOR = as.character(setor),
+    across(all_of(waste_cols), ~ suppressWarnings(as.numeric(.)))
+  )
+
+hh_waste_sf <- setores %>%
+  left_join(hh_waste, by = "CD_SETOR") %>%
+  mutate(area_sector = st_area(geometry))
+
+idx <- st_intersects(hh_waste_sf, st_union(unique_wmel_cells_setores), sparse = TRUE)
+hh_waste_sf <- hh_waste_sf[lengths(idx) > 0, ]
+
+hh_waste_intersections <- st_intersection(
+  unique_wmel_cells_setores %>% select(cell.id),
+  hh_waste_sf %>% select(CD_SETOR, all_of(waste_cols), area_sector)
+) %>%
+  mutate(
+    area_intersection = st_area(geometry),
+    weight = as.numeric(area_intersection / area_sector)
+  )
+
+household_waste_values <- hh_waste_intersections %>%
+  mutate(
+    waste_yes = rowSums(across(all_of(waste_cols_yes)), na.rm = TRUE) * weight,
+    waste_no = rowSums(across(all_of(waste_cols_no)), na.rm = TRUE) * weight
+  ) %>%
+  st_drop_geometry() %>%
+  group_by(cell.id) %>%
+  summarise(
+    waste_yes_sum = sum(waste_yes, na.rm = TRUE),
+    waste_no_sum = sum(waste_no, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    denom = waste_yes_sum + waste_no_sum,
+    proportion_no_waste_collection =
+      if_else(denom > 0, waste_no_sum / denom, NA_real_)
+  ) %>%
+  select(cell.id, proportion_no_waste_collection)
+
+```
+
+#### Household mains water connection
+
+```{r household_water, warning=FALSE}
+
+hh_water <- domicilio2 %>%
+  mutate(
+    CD_SETOR = as.character(setor),
+    V00464 = suppressWarnings(as.numeric(V00464))
+  ) %>%
+  select(CD_SETOR, V00464)
+
+hh_water_sf <- setores %>%
+  left_join(hh_water, by = "CD_SETOR") %>%
+  mutate(area_sector = st_area(geometry))
+
+idx <- st_intersects(hh_water_sf, st_union(unique_wmel_cells_setores), sparse = TRUE)
+hh_water_sf <- hh_water_sf[lengths(idx) > 0, ]
+
+hh_water_intersections <- st_intersection(
+  unique_wmel_cells_setores %>% select(cell.id),
+  hh_water_sf
+) %>%
+  mutate(
+    area_intersection = st_area(geometry),
+    weight = as.numeric(area_intersection / area_sector)
+  )
+
+household_water_values <- hh_water_intersections %>%
+  mutate(V00464_weighted = V00464 * weight) %>%
+  st_drop_geometry() %>%
+  group_by(cell.id) %>%
+  summarise(
+    number_households_no_mains_water_connection =
+      sum(V00464_weighted, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+#### Household sewage collection
+
+```{r household_sewage, warning=FALSE}
+
+sewage_cols_yes <- c("V00309", "V00310")
+sewage_cols_no <- c("V00311", "V00312", "V00313", "V00314", "V00315", "V00316")
+sewage_cols <- intersect(c(sewage_cols_yes, sewage_cols_no), names(domicilio2))
+
+hh_sewage <- domicilio2 %>%
+  mutate(
+    CD_SETOR = as.character(setor),
+    across(all_of(sewage_cols), ~ suppressWarnings(as.numeric(.)))
+  )
+
+hh_sewage_sf <- setores %>%
+  left_join(hh_sewage, by = "CD_SETOR") %>%
+  mutate(area_sector = st_area(geometry))
+
+idx <- st_intersects(hh_sewage_sf, st_union(unique_wmel_cells_setores), sparse = TRUE)
+hh_sewage_sf <- hh_sewage_sf[lengths(idx) > 0, ]
+
+hh_sewage_intersections <- st_intersection(
+  unique_wmel_cells_setores %>% select(cell.id),
+  hh_sewage_sf %>% select(CD_SETOR, all_of(sewage_cols), area_sector)
+) %>%
+  mutate(
+    area_intersection = st_area(geometry),
+    weight = as.numeric(area_intersection / area_sector)
+  )
+
+household_sewage_values <- hh_sewage_intersections %>%
+  mutate(
+    sewage_yes = rowSums(across(all_of(sewage_cols_yes)), na.rm = TRUE) * weight,
+    sewage_no = rowSums(across(all_of(sewage_cols_no)), na.rm = TRUE) * weight
+  ) %>%
+  st_drop_geometry() %>%
+  group_by(cell.id) %>%
+  summarise(
+    sewage_yes_sum = sum(sewage_yes, na.rm = TRUE),
+    sewage_no_sum = sum(sewage_no, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    denom = sewage_yes_sum + sewage_no_sum,
+    proportion_households_no_sewage_collection =
+      if_else(denom > 0, sewage_no_sum / denom, NA_real_)
+  ) %>%
+  select(cell.id, proportion_households_no_sewage_collection)
+
+```
+
+#### Human population
+
+```{r human_pop, warning=FALSE}
+
+population <- dados_basico %>%
+  mutate(
+    CD_SETOR = as.character(CD_SETOR),
+    v0001 = suppressWarnings(as.numeric(v0001))
+  ) %>%
+  select(CD_SETOR, v0001)
+
+population_sf <- setores %>%
+  left_join(population, by = "CD_SETOR") %>%
+  mutate(area_sector = st_area(geometry))
+
+idx <- st_intersects(population_sf, st_union(unique_wmel_cells_setores), sparse = TRUE)
+population_sf <- population_sf[lengths(idx) > 0, ]
+
+popualtion_intersections <- st_intersection(
+  unique_wmel_cells_setores %>% select(cell.id),
+  population_sf
+) %>%
+  mutate(
+    area_intersection = st_area(geometry),
+    weight = as.numeric(area_intersection / area_sector)
+  )
+
+popualtion_values <- popualtion_intersections %>%
+  mutate(v0001_weighted = v0001 * weight) %>%
+  st_drop_geometry() %>%
+  group_by(cell.id) %>%
+  summarise(
+    human_population = sum(v0001_weighted, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+#### Literacy
+
+```{r literacy, warning=FALSE}
+
+literacy_cols <- c(
+  "V00644", "V00645", "V00646", "V00647", "V00648", "V00649", "V00650",
+  "V00651", "V00652", "V00653", "V00654", "V00655", "V00656"
+)
+
+literacy <- alfabetizacao %>%
+  mutate(
+    CD_SETOR = as.character(CD_setor),
+    across(all_of(literacy_cols), ~ suppressWarnings(as.numeric(.)))
+  ) %>%
+  select(CD_SETOR, all_of(literacy_cols))
+
+literacy_sf <- setores %>%
+  left_join(literacy, by = "CD_SETOR") %>%
+  mutate(area_sector = st_area(geometry))
+
+idx <- st_intersects(literacy_sf, st_union(unique_wmel_cells_setores), sparse = TRUE)
+literacy_sf <- literacy_sf[lengths(idx) > 0, ]
+
+literacy_intersections <- st_intersection(
+  unique_wmel_cells_setores %>% select(cell.id),
+  literacy_sf
+) %>%
+  mutate(
+    area_intersection = st_area(geometry),
+    weight = as.numeric(area_intersection / area_sector)
+  )
+
+literacy_values <- literacy_intersections %>%
+  mutate(
+    average_literacy_weighted =
+      rowMeans(across(all_of(literacy_cols)), na.rm = TRUE) * weight
+  ) %>%
+  st_drop_geometry() %>%
+  group_by(cell.id) %>%
+  summarise(
+    average_literacy = sum(average_literacy_weighted, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+#### Household income
+
+```{r household_income, warning=FALSE}
+
+hh_income <- bairros %>%
+  filter(CD_BAIRRO %in% renda_bairro$CD_BAIRRO) %>%
+  group_by(CD_BAIRRO) %>%
+  mutate(CD_BAIRRO = as.numeric(CD_BAIRRO)) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop") %>%
+  left_join(renda_bairro, by = "CD_BAIRRO") %>%
+  mutate(
+    V06001 = suppressWarnings(as.numeric(V06001)),
+    V06004 = suppressWarnings(as.numeric(V06004)),
+    area_bairro = st_area(geometry)
+  ) %>%
+  select(CD_BAIRRO, V06001, V06004, area_bairro)
+
+idx <- st_intersects(hh_income, st_union(unique_wmel_cells_bairros), sparse = TRUE)
+hh_income <- hh_income[lengths(idx) > 0, ]
+
+hh_income_intersections <- st_intersection(
+  unique_wmel_cells_bairros %>% select(cell.id),
+  hh_income
+) %>%
+  mutate(
+    area_intersection = st_area(geometry),
+    weight = as.numeric(area_intersection / area_bairro),
+    hh_in_cell = V06001 * weight,
+    income_contrib = V06004 * hh_in_cell
+  )
+
+hh_income_values <- hh_income_intersections %>%
+  st_drop_geometry() %>%
+  group_by(cell.id) %>%
+  summarise(
+    households_in_cell = sum(hh_in_cell, na.rm = TRUE),
+    income_contrib_sum = sum(income_contrib, na.rm = TRUE),
+    average_household_income =
+      if_else(households_in_cell > 0, income_contrib_sum / households_in_cell, NA_real_),
+    .groups = "drop"
+  ) %>%
+  select(cell.id, average_household_income)
+
+```
+
+## Elevation
+
+Source: IBGE DSM data https://www.ibge.gov.br/geociencias/modelos-digitais-de-superficie/modelos-digitais-de-superficie/10856-mde-modelo-digital-de-elevacao.html?=&t=downloads > rj25 > tif > which zip file?
+Many tif files named by index codes -> map index reference doc: https://www.ibge.gov.br/geociencias/downloads-geociencias.html > cartas_e_mapas > mapa_indice_digital > mapa_indice_digital_5ed_2021 > mapa_indice_digital_5ed_2021.zip
+Map indices for deployment area = "2745-3-NE" "2745-4-NO" "2745-4-SO"
+Extracted data in GoogleEarthEngine and imported csv here.
+
+```{r elevation, warning=FALSE}
+
+elevation_values <- read_csv("IBGE_Elevation_2015_raster_cells.csv", show_col_types = FALSE) %>%
+  rename(cell.id = cell_id, elevation = DSM) %>%
+  select(cell.id, elevation) %>%
+  arrange(cell.id)
+
+```
+
+## Highways
+Source: OpenStreetMap from osmdata()
+
+```{r highways, warning=FALSE}
+
+rio_bb <- getbb("Rio de Janeiro")
+
+highways <- rio_bb %>%
+  opq() %>%
+  add_osm_feature(key = "highway", value = c("motorway", "primary", "secondary")) %>%
+  osmdata_sf()
+
+highways_utm <- st_transform(highways$osm_lines, st_crs(unique_wmel_cells)) %>%
+  st_make_valid() %>%
+  select(osm_id, name, highway, lanes, width, geometry) %>%
+  mutate(
+    lanes = suppressWarnings(as.numeric(lanes)),
+    width = suppressWarnings(as.numeric(width))
+  )
+
+idx <- st_intersects(highways_utm, st_union(unique_wmel_cells), sparse = TRUE)
+highways_utm <- highways_utm[lengths(idx) > 0, ]
+
+highways_utm <- highways_utm %>%
+  mutate(
+    lanes = if_else(is.na(lanes), 2, lanes),
+    width_from_lanes = if_else(highway == "motorway", lanes * 3.5, lanes * 3)
+  )
+
+cell_area_m2 <- 250000
+
+highway_intersection_cells <- st_intersection(
+  unique_wmel_cells %>% select(cell.id),
+  highways_utm %>% select(width_from_lanes)
+)
+
+highway_values_cells <- highway_intersection_cells %>%
+  mutate(highway_area_m2 = as.numeric(st_length(geometry)) * width_from_lanes) %>%
+  st_drop_geometry() %>%
+  group_by(cell.id) %>%
+  summarise(highway_area_m2 = sum(highway_area_m2, na.rm = TRUE), .groups = "drop") %>%
+  mutate(proportion_highway_cells = highway_area_m2 / cell_area_m2) %>%
+  select(cell.id, proportion_highway_cells)
+
+highway_intersection_flight_buffer <- st_intersection(
+  hollow_flight_buffers %>% select(cell.id),
+  highways_utm %>% select(width_from_lanes)
+)
+
+flight_area_m2 <- as.numeric(st_area(hollow_flight_buffers[1, ]))
+
+highway_values_flight_buffer <- highway_intersection_flight_buffer %>%
+  mutate(highway_area_m2 = as.numeric(st_length(geometry)) * width_from_lanes) %>%
+  st_drop_geometry() %>%
+  group_by(cell.id) %>%
+  summarise(highway_area_m2 = sum(highway_area_m2, na.rm = TRUE), .groups = "drop") %>%
+  mutate(proportion_highway_flight_buffer = highway_area_m2 / flight_area_m2) %>%
+  select(cell.id, proportion_highway_flight_buffer)
+
+highway_values <- highway_values_cells %>%
+  full_join(highway_values_flight_buffer, by = "cell.id") %>%
+  mutate(
+    proportion_highways = rowSums(
+      across(c(proportion_highway_cells, proportion_highway_flight_buffer)),
+      na.rm = TRUE
+    )
+  ) %>%
+  select(cell.id, proportion_highways)
+
+```
+
+## LULC land use
+Source: RioDataPortal (IBGE)
+
+```{r land_use, warning=FALSE}
+
+lulc_raw <- read_sf("Uso_do_Solo_2018.geojson")
+
+lulc_translation <- c(
+  "Afloramentos rochosos e depósitos sedimentares" = "rock_outcrops",
+  "Áreas agrícolas" = "agricultural",
+  "Áreas de comércio e serviços" = "commercial",
+  "Áreas de educação e saúde" = "education_health",
+  "Áreas de exploração mineral" = "mining",
+  "Áreas de lazer" = "leisure",
+  "Áreas de transporte" = "transport",
+  "Áreas industriais" = "industrial",
+  "Áreas institucionais e de infraestrutura pública" = "public_infrastructure",
+  "Áreas não edificadas" = "unbuilt",
+  "Áreas residenciais" = "residential",
+  "Áreas sujeitas à inundação" = "flood_prone",
+  "Cobertura arbórea e arbustiva" = "tree_shrub",
+  "Cobertura gramíneo lenhosa" = "woody_grass",
+  "Corpos hídricos" = "water_bodies",
+  "Favela" = "favela"
+)
+
+lulc_raw$lulc_eng <- lulc_translation[lulc_raw$usoagregad]
+
+unique_wmel_cells_lulc <- st_transform(unique_wmel_cells, st_crs(lulc_raw))
+
+idx <- st_intersects(lulc_raw, st_union(unique_wmel_cells_lulc), sparse = TRUE)
+lulc_cells <- lulc_raw[lengths(idx) > 0, ]
+
+lulc_join <- st_intersection(unique_wmel_cells_lulc, lulc_cells) %>%
+  mutate(area = st_area(geometry))
+
+lulc_area_summary <- lulc_join %>%
+  group_by(cell.id, lulc_eng) %>%
+  summarise(area = sum(area), .groups = "drop") %>%
+  group_by(cell.id) %>%
+  mutate(
+    cell_area = sum(area),
+    weight = as.numeric(area / cell_area)
+  ) %>%
+  ungroup()
+
+lulc_proportions <- lulc_area_summary %>%
+  st_drop_geometry() %>%
+  select(cell.id, lulc_eng, weight) %>%
+  pivot_wider(names_from = lulc_eng, values_from = weight, values_fill = 0) %>%
+  group_by(cell.id) %>%
+  summarise(across(everything(), sum), .groups = "drop")
+
+names(lulc_proportions)[-1] <- paste0("proportion_", names(lulc_proportions)[-1])
+
+water_bodies_values <- lulc_proportions %>%
+  select(cell.id, proportion_water_bodies)
+
+flood_prone_values <- lulc_proportions %>%
+  select(cell.id, proportion_flood_prone)
+
+residential_values <- lulc_proportions %>%
+  select(cell.id, proportion_residential)
+
+vegetation_values <- lulc_proportions %>%
+  mutate(
+    proportion_vegetation = rowSums(
+      across(c(proportion_tree_shrub, proportion_woody_grass)),
+      na.rm = TRUE
+    )
+  ) %>%
+  select(cell.id, proportion_vegetation)
+
+favela_values <- lulc_proportions %>%
+  select(cell.id, proportion_favela)
+
+# Combined cell + flight-buffer non-residential land use
+hollow_flight_buffers_lulc <- st_transform(hollow_flight_buffers, st_crs(lulc_raw))
+
+idx <- st_intersects(lulc_raw, st_union(hollow_flight_buffers_lulc), sparse = TRUE)
+lulc_buffers <- lulc_raw[lengths(idx) > 0, ]
+
+lulc_join_flight_buffers <- st_intersection(hollow_flight_buffers_lulc, lulc_buffers) %>%
+  mutate(area = st_area(geometry))
+
+lulc_area_summary_flight_buffers <- lulc_join_flight_buffers %>%
+  group_by(cell.id, lulc_eng) %>%
+  summarise(area = sum(area), .groups = "drop") %>%
+  group_by(cell.id) %>%
+  mutate(
+    cell_area = sum(area),
+    weight = as.numeric(area / cell_area)
+  ) %>%
+  ungroup()
+
+lulc_cell <- st_drop_geometry(lulc_area_summary) %>%
+  select(cell.id, lulc_eng, area, cell_area)
+
+lulc_flight_buffers <- st_drop_geometry(lulc_area_summary_flight_buffers) %>%
+  select(cell.id, lulc_eng, area, cell_area)
+
+lulc_area_total <- bind_rows(lulc_cell, lulc_flight_buffers) %>%
+  group_by(cell.id, lulc_eng) %>%
+  summarise(area_total = sum(area, na.rm = TRUE), .groups = "drop")
+
+lulc_cell_total <- bind_rows(
+  lulc_cell %>% distinct(cell.id, cell_area),
+  lulc_flight_buffers %>% distinct(cell.id, cell_area)
+) %>%
+  group_by(cell.id) %>%
+  summarise(cell_area_total = sum(cell_area, na.rm = TRUE), .groups = "drop")
+
+lulc_proportion_total <- lulc_area_total %>%
+  left_join(lulc_cell_total, by = "cell.id") %>%
+  mutate(proportion = as.numeric(area_total / cell_area_total)) %>%
+  select(cell.id, lulc_eng, proportion) %>%
+  pivot_wider(names_from = lulc_eng, values_from = proportion, values_fill = 0) %>%
+  arrange(cell.id)
+
+names(lulc_proportion_total)[-1] <- paste0("proportion_", names(lulc_proportion_total)[-1])
+
+non_residential_cols <- c(
+  "proportion_commercial",
+  "proportion_industrial",
+  "proportion_education_health",
+  "proportion_public_infrastructure",
+  "proportion_transport",
+  "proportion_leisure"
+)
+
+non_residential_values <- lulc_proportion_total %>%
+  mutate(
+    proportion_non_residential =
+      rowSums(across(all_of(non_residential_cols)), na.rm = TRUE)
+  ) %>%
+  select(cell.id, proportion_non_residential)
+
+```
+
+## Building volume
+Source: 1km buffer zone exported from GoogleEarthEngine, GHSL Built Characteristics https://developers.google.com/earth-engine/datasets/catalog/JRC_GHSL_P2023A_GHS_BUILT_V
+
+```{r building_volume, warning=FALSE}
+
+built_volume <- terra::rast("GHS_BUILT_V_2015_rio_buffer1km_ESRI54009_10m.tif")
+
+unique_wmel_cells_built_volume <- st_transform(unique_wmel_cells, terra::crs(built_volume))
+
+built_volume_sum <- exactextractr::exact_extract(
+  built_volume,
+  unique_wmel_cells_built_volume,
+  fun = "sum"
+)
+
+hollow_flight_buffers_built_volume <- st_transform(hollow_flight_buffers, terra::crs(built_volume)) %>%
+  mutate(buffer_area_m2 = as.numeric(st_area(geometry)))
+
+built_volume_sum_flight_buffers <- exactextractr::exact_extract(
+  built_volume,
+  hollow_flight_buffers_built_volume,
+  fun = "sum"
+)
+
+built_volume_values <- tibble(
+  cell.id = unique_wmel_cells_built_volume$cell.id,
+  built_volume_sum_cell = built_volume_sum,
+  built_volume_sum_flight_buffers = built_volume_sum_flight_buffers,
+  buffer_area_m2 = hollow_flight_buffers_built_volume$buffer_area_m2
+) %>%
+  mutate(
+    built_volume_sum =
+      built_volume_sum_cell + built_volume_sum_flight_buffers,
+    built_volume_density =
+      built_volume_sum / (cell_area_m2 + buffer_area_m2)
+  ) %>%
+  select(cell.id, built_volume_density)
+
+```
+
+## Non-residential building volume
+Source: 1km buffer zone exported from GoogleEarthEngine, GHSL Built Characteristics https://developers.google.com/earth-engine/datasets/catalog/JRC_GHSL_P2023A_GHS_BUILT_V
+
+```{r nres_building_volume, warning=FALSE}
+
+nres_built_volume <- terra::rast("GHS_BUILT_V_2015_rio_buffer1km_ESRI54009_10m_nres.tif")
+
+unique_wmel_cells_nres_built_volume <- st_transform(unique_wmel_cells, terra::crs(nres_built_volume))
+
+nres_built_volume_sum <- exactextractr::exact_extract(
+  nres_built_volume,
+  unique_wmel_cells_nres_built_volume,
+  fun = "sum"
+)
+
+hollow_flight_buffers_nres_built_volume <- st_transform(hollow_flight_buffers, terra::crs(nres_built_volume)) %>%
+  mutate(buffer_area_m2 = as.numeric(st_area(geometry)))
+
+nres_built_volume_sum_flight_buffers <- exactextractr::exact_extract(
+  nres_built_volume,
+  hollow_flight_buffers_nres_built_volume,
+  fun = "sum"
+)
+
+nres_built_volume_values <- tibble(
+  cell.id = unique_wmel_cells_nres_built_volume$cell.id,
+  nres_built_volume_sum_cell = nres_built_volume_sum,
+  nres_built_volume_sum_flight_buffers = nres_built_volume_sum_flight_buffers,
+  buffer_area_m2 = hollow_flight_buffers_nres_built_volume$buffer_area_m2
+) %>%
+  mutate(
+    nres_built_volume_sum =
+      nres_built_volume_sum_cell + nres_built_volume_sum_flight_buffers,
+    nres_built_volume_density =
+      nres_built_volume_sum / (cell_area_m2 + buffer_area_m2)
+  ) %>%
+  select(cell.id, nres_built_volume_density)
+
+```
+
+## Building height
+Source: 1km buffer zone exported from GEE, GHSL Built Characteristics https://developers.google.com/earth-engine/datasets/catalog/JRC_GHSL_P2023A_GHS_BUILT_C
+Documentation: https://human-settlement.emergency.copernicus.eu/documents/GHSL_Data_Package_2023.pdf?t=1683540422
+..."the Morphological Settlement Zone (MSZ) defines the spatial domain of all the human settlements... areas outside the MSZ are not classified" aka class 0 is unclassified
+
+```{r building_height, warning=FALSE}
+
+built_characteristics <- terra::rast("GHS_BUILT_C_2018_rio_buffer1km_ESRI54009_10m.tif")
+built_characteristics <- terra::classify(built_characteristics, rbind(c(255, NA)))
+weights <- terra::cellSize(built_characteristics, unit = "m")
+
+extract_class_areas <- function(polys) {
+  polys_transformed <- st_transform(polys, terra::crs(built_characteristics))
+  
+  class_area_list <- exactextractr::exact_extract(
+    built_characteristics,
+    polys_transformed,
+    fun = function(values, coverage_fraction, weights) {
+      tapply(coverage_fraction * weights, values, sum, na.rm = TRUE)
+    },
+    weights = weights,
+    progress = TRUE
+  )
+  
+  bind_rows(
+    lapply(class_area_list, function(x) if (is.null(x)) NULL else as.list(x)),
+    .id = "cell.id"
+  ) %>%
+    mutate(cell.id = as.integer(cell.id)) %>%
+    mutate(across(-cell.id, ~ suppressWarnings(as.numeric(.)))) %>%
+    mutate(across(-cell.id, ~ replace_na(., 0)))
+}
+
+class_areas_df <- extract_class_areas(unique_wmel_cells)
+class_areas_df_flight_buffers <- extract_class_areas(hollow_flight_buffers)
+
+class_areas_df_total <- bind_rows(class_areas_df, class_areas_df_flight_buffers) %>%
+  group_by(cell.id) %>%
+  summarise(across(where(is.numeric), ~ sum(.x, na.rm = TRUE)), .groups = "drop") %>%
+  arrange(cell.id)
+
+class_cols <- names(class_areas_df_total) != "cell.id"
+class_areas_sum <- rowSums(class_areas_df_total[, class_cols], na.rm = TRUE)
+
+built_characteristics_proportions <- sweep(
+  class_areas_df_total[, class_cols],
+  1,
+  class_areas_sum,
+  `/`
+)
+
+name_map <- c(
+  "0"  = "GHSL0_unclassified",
+  "1"  = "GHSL1_open_low_veg",
+  "2"  = "GHSL2_open_med_veg",
+  "3"  = "GHSL3_open_high_veg",
+  "4"  = "GHSL4_open_water",
+  "5"  = "GHSL5_open_road",
+  "11" = "GHSL11_built_res_3m",
+  "12" = "GHSL12_built_res_6m",
+  "13" = "GHSL13_built_res_15m",
+  "14" = "GHSL14_built_res_30m",
+  "15" = "GHSL15_built_res_30m_plus",
+  "21" = "GHSL21_built_nonres_3m",
+  "22" = "GHSL22_built_nonres_6m",
+  "23" = "GHSL23_built_nonres_15m",
+  "24" = "GHSL24_built_nonres_30m",
+  "25" = "GHSL25_built_nonres_30m_plus"
+)
+
+colnames(built_characteristics_proportions) <-
+  name_map[colnames(built_characteristics_proportions)]
+
+built_characteristics_proportions$cell.id <- class_areas_df_total$cell.id
+
+tall_cols <- c(
+  "GHSL13_built_res_15m",
+  "GHSL14_built_res_30m",
+  "GHSL15_built_res_30m_plus",
+  "GHSL23_built_nonres_15m",
+  "GHSL24_built_nonres_30m",
+  "GHSL25_built_nonres_30m_plus"
+)
+
+building_height_values <- built_characteristics_proportions %>%
+  transmute(
+    cell.id,
+    proportion_buildings_over6m =
+      rowSums(across(any_of(tall_cols)), na.rm = TRUE)
+  )
+
+```
+
+## ALERTA weather stations
+Source: ALERTA weather station coordinates and info: https://www.sistema-alerta-rio.com.br/info-estacoes/
+
+```{r weather_stations, warning=FALSE}
+
+ALERTA_coords <- read_csv("ALERTA_station_coordinates.csv", show_col_types = FALSE) %>%
+  mutate(
+    Estação = tolower(Estação),
+    station = recode(
+      Estação,
+      "santa teresa" = "santa_teresa",
+      "grajaú" = "grajau",
+      "ilha do governador" = "ilha_do_governador",
+      "irajá" = "iraja",
+      "jacarepaguá/tanque" = "tanque",
+      "saúde" = "saude",
+      "jardim botânico" = "jardim_botanico",
+      "barra/barrinha" = "barrinha",
+      "jacarepaguá/cidade de deus" = "cidade_de_deus",
+      "barra/riocentro" = "riocentro",
+      "est. grajaú/jacarepaguá" = "grajau_jacarepagua",
+      "santa cruz" = "santa_cruz",
+      "grande méier" = "grande_meier",
+      "grota funda" = "grota_funda",
+      "campo grande" = "campo_grande",
+      "alto da boa vista" = "alto_da_boa_vista",
+      "av. brasil/mendanha" = "av_brasil_mendanha",
+      "recreio dos bandeirantes" = "recreio",
+      "são cristóvão" = "sao_cristovao",
+      "tijuca/muda" = "tijuca_muda"
+    )
+  )
+
+ALERTA_sf <- ALERTA_coords %>%
+  select(station, X, Y) %>%
+  st_as_sf(coords = c("X", "Y"), crs = 29193)
+
+```
+
+#### Temperature, humidity, and wind speed
+
+```{r temp_humid_wind, warning=FALSE}
+
+folder_path <- c(
+  "DadosMeteorologicos2017",
+  "DadosMeteorologicos2018",
+  "DadosMeteorologicos2019",
+  "DadosMeteorologicos2020"
+)
+
+all_files <- list.files(
+  path = folder_path,
+  pattern = "\\.txt$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+read_weather_file <- function(file_path) {
+  tryCatch({
+    df <- suppressWarnings(
+      read_table(file_path, skip = 3, na = "ND", col_names = FALSE, show_col_types = FALSE)
+    )
+    
+    df <- df[-c(1:2), ]
+    
+    first_hbv_row <- head(which(df[, 3] == "HBV"), 1)
+    last_hbv_row <- tail(which(df[, 3] == "HBV"), 1)
+    total_length <- nrow(df)
+    
+    column_names <- c(
+      "date", "time", "HBV", "rain_mm", "wind_dir_deg",
+      "wind_speed_kmh", "temp_c", "pressure_hpa", "humidity_pct"
+    )
+    
+    if (length(first_hbv_row) > 0 && length(last_hbv_row) > 0) {
+      df1 <- df[1:(first_hbv_row - 1), ]
+      colnames(df1) <- c(
+        "date", "time", "rain_mm", "wind_dir_deg", "wind_speed_kmh",
+        "temp_c", "pressure_hpa", "humidity_pct", "HBV"
+      )
+      df1 <- df1[, column_names]
+      
+      df2 <- df[first_hbv_row:last_hbv_row, ]
+      colnames(df2) <- column_names
+      
+      df3 <- df[(last_hbv_row + 1):total_length, ]
+      colnames(df3) <- c(
+        "date", "time", "rain_mm", "wind_dir_deg", "wind_speed_kmh",
+        "temp_c", "pressure_hpa", "humidity_pct", "HBV"
+      )
+      df3 <- df3[, column_names]
+      
+      combined_df <- bind_rows(df1, df2, df3)
+    } else {
+      colnames(df) <- c(
+        "date", "time", "rain_mm", "wind_dir_deg", "wind_speed_kmh",
+        "temp_c", "pressure_hpa", "humidity_pct", "HBV"
+      )
+      combined_df <- df[, column_names]
+    }
+    
+    combined_df <- combined_df[rowSums(is.na(combined_df)) != ncol(combined_df), ]
+    
+    combined_df[, 3:9] <- lapply(
+      combined_df[, 3:9],
+      function(x) suppressWarnings(as.numeric(x))
+    )
+    
+    combined_df$datetime <- dmy_hms(
+      paste(combined_df$date, combined_df$time),
+      tz = "America/Sao_Paulo"
+    )
+    
+    filename <- basename(file_path)
+    year_month <- str_extract(filename, "20\\d{4}")
+    
+    combined_df$year <- as.integer(str_sub(year_month, 1, 4))
+    combined_df$month <- as.integer(str_sub(year_month, 5, 6))
+    combined_df$station <- str_remove(filename, "_20\\d{4}_Met\\.txt$") %>%
+      str_to_lower()
+    
+    combined_df
+  }, error = function(e) {
+    message("Problem with file: ", file_path)
+    NULL
+  })
+}
+
+combined_weather_data <- map_dfr(all_files, read_weather_file)
+
+combined_weather_sf <- combined_weather_data %>%
+  left_join(ALERTA_sf, by = "station") %>%
+  st_as_sf()
+
+monthly_weather <- combined_weather_sf %>%
+  group_by(station, year, month) %>%
+  summarise(
+    temp_c_mean = mean(temp_c, na.rm = TRUE),
+    humidity_mean = mean(humidity_pct, na.rm = TRUE),
+    wind_speed_mean = mean(wind_speed_kmh, na.rm = TRUE),
+    geometry = first(geometry),
+    .groups = "drop"
+  ) %>%
+  st_as_sf()
+
+interpolate_weather_idw <- function(weather_data, variable_name, year_val, month_val, cells) {
+  subset_data <- weather_data %>%
+    filter(year == year_val, month == month_val) %>%
+    filter(!is.na(.data[[variable_name]]))
+  
+  if (nrow(subset_data) < 2) return(NULL)
+  
+  idw_model <- gstat::gstat(
+    formula = as.formula(paste(variable_name, "~ 1")),
+    data = subset_data,
+    nmax = 10,
+    set = list(idp = 1)
+  )
+  
+  cells_transformed <- st_transform(cells, st_crs(subset_data))
+  predictions <- predict(idw_model, newdata = cells_transformed)
+  
+  predictions %>%
+    st_as_sf() %>%
+    rename(!!paste0(variable_name, "_idw") := var1.pred) %>%
+    mutate(
+      cell.id = cells$cell.id,
+      year = year_val,
+      month = month_val
+    ) %>%
+    select(cell.id, year, month, ends_with("_idw"))
+}
+
+interpolate_weather_idw_buffer <- function(weather_data, variable_name, year_val, month_val, cells, buffer) {
+  subset_data <- weather_data %>%
+    filter(year == year_val, month == month_val) %>%
+    filter(!is.na(.data[[variable_name]]))
+  
+  if (nrow(subset_data) < 2) return(NULL)
+  
+  idw_model <- gstat::gstat(
+    formula = as.formula(paste(variable_name, "~ 1")),
+    data = subset_data,
+    nmax = 10,
+    set = list(idp = 1)
+  )
+  
+  cells_transformed <- st_transform(cells, st_crs(subset_data))
+  buffer_transformed <- st_transform(buffer, st_crs(subset_data))
+  
+  predictions_cell <- predict(idw_model, newdata = cells_transformed)
+  predictions_buffer <- predict(idw_model, newdata = buffer_transformed)
+  
+  col_cell <- paste0(variable_name, "_idw_cell")
+  col_buffer <- paste0(variable_name, "_idw_buffer")
+  col_avg <- paste0(variable_name, "_idw")
+  
+  pred_cells <- predictions_cell %>%
+    transmute(
+      cell.id = cells$cell.id,
+      year = year_val,
+      month = month_val,
+      !!col_cell := var1.pred
+    ) %>%
+    st_drop_geometry()
+  
+  pred_buffer <- predictions_buffer %>%
+    transmute(
+      cell.id = buffer$cell.id,
+      year = year_val,
+      month = month_val,
+      !!col_buffer := var1.pred
+    ) %>%
+    st_drop_geometry()
+  
+  left_join(pred_cells, pred_buffer, by = c("cell.id", "year", "month")) %>%
+    mutate(
+      !!col_avg := rowMeans(across(c(all_of(col_cell), all_of(col_buffer))), na.rm = TRUE)
+    ) %>%
+    select(cell.id, year, month, all_of(col_avg))
+}
+
+year_month_grid <- monthly_weather %>%
+  distinct(year, month)
+
+idw_temp <- pmap_dfr(
+  list(year_month_grid$year, year_month_grid$month),
+  ~ interpolate_weather_idw(monthly_weather, "temp_c_mean", ..1, ..2, unique_wmel_cells)
+) %>%
+  st_drop_geometry()
+
+idw_humidity <- pmap_dfr(
+  list(year_month_grid$year, year_month_grid$month),
+  ~ interpolate_weather_idw(monthly_weather, "humidity_mean", ..1, ..2, unique_wmel_cells)
+) %>%
+  st_drop_geometry()
+
+idw_temperature_humidity_combined <- left_join(
+  idw_temp,
+  idw_humidity,
+  by = c("cell.id", "year", "month")
+)
+
+idw_wind_speed <- pmap_dfr(
+  list(year_month_grid$year, year_month_grid$month),
+  ~ interpolate_weather_idw_buffer(
+    monthly_weather,
+    "wind_speed_mean",
+    ..1,
+    ..2,
+    unique_wmel_cells,
+    hollow_flight_buffers
+  )
+) %>%
+  st_drop_geometry()
+
+```
+
+#### Rainfall
+
+```{r rain, warning=FALSE}
+
+folder_path <- c(
+  "DadosPluviometricos2017",
+  "DadosPluviometricos2018",
+  "DadosPluviometricos2019"
+)
+
+all_files <- list.files(
+  path = folder_path,
+  pattern = "\\.txt$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+read_rainfall_file <- function(file_path) {
+  tryCatch({
+    df <- read_table(file_path, skip = 5, na = "ND", col_names = FALSE, show_col_types = FALSE)
+    
+    if (df[5, 3] == "HBV") {
+      df <- df[, -3]
+    }
+    
+    names(df) <- c("date", "time", "rain_15min", "rain_1h", "rain_4h", "rain_24h", "rain_96h")
+    
+    df[, 3:ncol(df)] <- lapply(df[, 3:ncol(df)], function(x) suppressWarnings(as.numeric(x)))
+    
+    df$datetime <- dmy_hms(
+      paste(df$date, df$time),
+      tz = "America/Sao_Paulo"
+    )
+    
+    filename <- basename(file_path)
+    year_month <- str_extract(filename, "20\\d{4}")
+    
+    df$year <- as.integer(str_sub(year_month, 1, 4))
+    df$month <- as.integer(str_sub(year_month, 5, 6))
+    df$station <- str_remove(filename, "_20\\d{4}_Plv\\.txt$") %>%
+      str_to_lower()
+    
+    df
+  }, error = function(e) {
+    message("Problem with file: ", file_path)
+    NULL
+  })
+}
+
+combined_rainfall_data <- map_dfr(all_files, read_rainfall_file)
+
+combined_rainfall_sf <- combined_rainfall_data %>%
+  left_join(ALERTA_sf, by = "station") %>%
+  st_as_sf()
+
+monthly_rainfall <- combined_rainfall_sf %>%
+  group_by(station, year, month) %>%
+  summarise(
+    rain_24h_mean = mean(rain_24h, na.rm = TRUE),
+    geometry = first(geometry),
+    .groups = "drop"
+  ) %>%
+  st_as_sf()
+
+interpolate_monthly_idw <- function(rain_data, variable_name, year_val, month_val, cells) {
+  rain_subset <- rain_data %>%
+    filter(year == year_val, month == month_val) %>%
+    filter(!is.na(.data[[variable_name]]))
+  
+  if (nrow(rain_subset) < 2) return(NULL)
+  
+  idw_model <- gstat::gstat(
+    formula = as.formula(paste(variable_name, "~ 1")),
+    data = rain_subset,
+    nmax = 10,
+    set = list(idp = 2)
+  )
+  
+  cells_transformed <- st_transform(cells, st_crs(rain_subset))
+  predictions <- predict(idw_model, newdata = cells_transformed)
+  
+  predictions %>%
+    st_as_sf() %>%
+    rename(!!paste0(variable_name, "_idw") := var1.pred) %>%
+    mutate(
+      cell.id = cells$cell.id,
+      year = year_val,
+      month = month_val
+    ) %>%
+    select(cell.id, year, month, ends_with("_idw"))
+}
+
+year_month_grid <- monthly_rainfall %>%
+  distinct(year, month)
+
+idw_24h <- pmap_dfr(
+  list(year_month_grid$year, year_month_grid$month),
+  ~ interpolate_monthly_idw(monthly_rainfall, "rain_24h_mean", ..1, ..2, unique_wmel_cells)
+) %>%
+  st_drop_geometry()
+
+weather_values <- idw_temperature_humidity_combined %>%
+  left_join(idw_24h, by = c("cell.id", "year", "month")) %>%
+  group_by(cell.id) %>%
+  summarise(
+    temp_c_mean_idw = mean(temp_c_mean_idw, na.rm = TRUE),
+    humidity_mean_idw = mean(humidity_mean_idw, na.rm = TRUE),
+    rain_24h_mean_idw = mean(rain_24h_mean_idw, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+wind_speed_values <- idw_wind_speed %>%
+  group_by(cell.id) %>%
+  summarise(
+    wind_speed_mean_idw = mean(wind_speed_mean_idw, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+
+## FINAL PREDICTORS DATAFRAME
+
+```{r pred_dataframe, warning=FALSE}
+
+predictor_df <- unique_wmel_cells %>%
+  st_drop_geometry() %>%
+  select(cell.id) %>%
+  left_join(average_neighbouring_wmel_values, by = "cell.id") %>%
+  left_join(weather_values, by = "cell.id") %>%
+  left_join(wind_speed_values, by = "cell.id") %>%
+  left_join(water_tank_values, by = "cell.id") %>%
+  left_join(breeding_containers_values, by = "cell.id") %>%
+  left_join(household_waste_values, by = "cell.id") %>%
+  left_join(household_water_values, by = "cell.id") %>%
+  left_join(household_sewage_values, by = "cell.id") %>%
+  left_join(popualtion_values, by = "cell.id") %>%
+  left_join(literacy_values, by = "cell.id") %>%
+  left_join(hh_income_values, by = "cell.id") %>%
+  left_join(elevation_values, by = "cell.id") %>%
+  left_join(highway_values, by = "cell.id") %>%
+  left_join(water_bodies_values, by = "cell.id") %>%
+  left_join(flood_prone_values, by = "cell.id") %>%
+  left_join(residential_values, by = "cell.id") %>%
+  left_join(vegetation_values, by = "cell.id") %>%
+  left_join(favela_values, by = "cell.id") %>%
+  left_join(non_residential_values, by = "cell.id") %>%
+  left_join(built_volume_values, by = "cell.id") %>%
+  left_join(nres_built_volume_values, by = "cell.id") %>%
+  left_join(building_height_values, by = "cell.id") %>%
+  arrange(cell.id)
+
+#write.csv(predictor_df, "model_predictors_df_updatedflightbarriers2025-09-30.csv", row.names = FALSE)
+
+```
+
+
+#### Supplementary Figure 2. Distribution map of the proportion of tall buildings across the release area
+
+```{r tall_buildings_map, fig.height=6, fig.width=8, warning=FALSE}
+
+map_plot_df_exp <- unique_wmel_cells %>%
+  st_centroid() %>%
+  mutate(x = st_coordinates(.)[,1],
+         y = st_coordinates(.)[,2]) %>%
+  left_join(building_height_values, by = "cell.id") %>%
+  st_drop_geometry()
+tall_cols <- c("#FFE6E6","#FDCFCF","#FBB8B8","#FAB0B0","#FAA2A2","#E26C6C","#B30000")
+tall_buildings_map <- ggplot() +
+  geom_sf(data = neighbour1_ll,  fill = "white", color = "grey40", linewidth = 0.2) +
+  geom_sf(data = neighbour2_ll,  fill = "white", color = "grey40", linewidth = 0.2) +
+  geom_sf(data = rio_city_ll,  fill = "white",     color = "black", linewidth = 0.5) +
+  geom_raster(data = map_plot_df_exp, aes(x = x, y = y, fill = proportion_buildings_over6m)) +
+  geom_text(aes(x = 686200, y = 7471700, label = "Atlantic\nOcean"), size = 3.8, fontface = "bold", color = "black") +
+  geom_text(aes(x = 672000, y = 7470500, label = "Municipality of\nRio de Janeiro"), size = 3.8, fontface = "bold", color = "black") +
+  geom_label(aes(x = 688850, y = 7471250, label = "Tall Buildings (%)"),
+             size = 3, fontface = "bold", fill = "white", colour = "black",
+             label.size = 0.25, # border thickness (mm)
+             label.r = grid::unit(0, "pt"), # square corners
+             label.padding = grid::unit(3, "pt")) +
+  coord_sf(crs = 32723,
+           xlim = c(bb_xy["xmin"], bb_xy["xmax"] + 180),
+           ylim = c(bb_xy["ymin"], bb_xy["ymax"] + 850)) +
+  scale_fill_gradientn(colors = tall_cols, na.value = "grey70", breaks = seq(0,0.6,0.1), limits = c(0,0.6)) +
+  labs(x = NULL, y = NULL, fill = NULL) +
+  theme_minimal() + 
+  theme(
+    panel.background = element_rect(fill = "#cfe8f3", colour = NA), # light blue ocean
+    legend.position = c(0.96, 0.115),
+    legend.justification = c(1, 0),
+    legend.background = element_rect(fill = "white", colour = "grey60"),
+    legend.box.margin = margin(4, 6, 4, 6),
+    legend.key.height = unit(10, "pt"),
+    legend.key.width  = unit(14, "pt")
+  )
+tall_buildings_map
+
+```

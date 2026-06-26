@@ -1,0 +1,264 @@
+---
+title: "model_predictors_breeding_container_definition"
+author: "K Tiley"
+date: "2026-06-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(dplyr)
+library(sf)
+library(mgcv)
+library(terra)
+library(exactextractr)
+
+```
+
+## Minimal wMel spatial setup for sensitivity analysis
+
+#### Wolbachia raster cells and flight buffers
+
+```{r wmel, warning=FALSE}
+
+wmel_rio <- read.csv("data_wmel_rio.csv")
+
+wmel_rio_releases <- wmel_rio %>%
+  filter(t >= 92) %>%
+  mutate(
+    date = as.Date(month),
+    year = as.integer(format(date, "%Y")),
+    month = as.integer(format(date, "%m"))
+  )
+
+wmel_points <- st_as_sf(
+  wmel_rio_releases,
+  coords = c("x", "y"),
+  crs = 32723
+)
+
+make_square <- function(pt, size) {
+  xy <- st_coordinates(pt)
+  h <- size / 2
+  
+  st_polygon(list(matrix(c(
+    xy[1] - h, xy[2] - h,
+    xy[1] + h, xy[2] - h,
+    xy[1] + h, xy[2] + h,
+    xy[1] - h, xy[2] + h,
+    xy[1] - h, xy[2] - h
+  ), ncol = 2, byrow = TRUE)))
+}
+
+make_square_sf <- function(sf_points, size) {
+  st_sf(
+    sf_points,
+    geometry = st_sfc(
+      lapply(st_geometry(sf_points), make_square, size = size),
+      crs = st_crs(sf_points)
+    )
+  )
+}
+
+# 500 × 500 m raster cells
+wmel_rio_releases_sf_xy_buffer <- make_square_sf(wmel_points, size = 500)
+
+unique_wmel_cells <- wmel_rio_releases_sf_xy_buffer %>%
+  select(cell.id) %>%
+  distinct()
+
+# 700 × 700 m buffers
+flight_buffers <- make_square_sf(wmel_points, size = 700)
+
+unique_flight_buffers <- flight_buffers %>%
+  transmute(cell.id, geometry) %>%
+  distinct()
+
+# Remove central 500 m cell to create hollow neighbouring buffer
+buffer_intersection_same_cell <- st_intersection(
+  unique_flight_buffers %>% rename(cell.id_flight = cell.id),
+  unique_wmel_cells
+) %>%
+  filter(cell.id_flight == cell.id)
+
+hollow_flight_buffers <- unique_flight_buffers %>%
+  rename(cell.id_flight = cell.id) %>%
+  st_difference(buffer_intersection_same_cell) %>%
+  filter(cell.id_flight == cell.id) %>%
+  transmute(cell.id = cell.id_flight, geometry) %>%
+  st_make_valid()
+
+```
+
+#### Neighbouring %wMel
+
+```{r neighbouring_wmel, warning=FALSE}
+
+cell_areas <- wmel_rio_releases_sf_xy_buffer %>%
+  mutate(area_cell = as.numeric(st_area(geometry))) %>%
+  st_drop_geometry() %>%
+  distinct(cell.id, area_cell)
+
+intersection_sf <- st_intersection(
+  hollow_flight_buffers %>%
+    transmute(cell.id_flight = cell.id, geometry),
+  wmel_rio_releases_sf_xy_buffer %>%
+    select(cell.id, year, month, wmel_pctg)
+) %>%
+  mutate(area_intersection = as.numeric(st_area(geometry))) %>%
+  left_join(cell_areas, by = "cell.id") %>%
+  mutate(
+    weight = area_intersection / area_cell,
+    weighted_wmel_pctg = wmel_pctg * weight
+  )
+
+average_neighbouring_wmel_values <- intersection_sf %>%
+  st_drop_geometry() %>%
+  group_by(cell.id_flight) %>%
+  summarise(
+    neighbouring_wmel_pctg_mean_avg =
+      sum(weighted_wmel_pctg, na.rm = TRUE) /
+      sum(weight, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(cell.id = cell.id_flight)
+
+```
+
+#### Water tank density
+Source: Steffen Knoblauch
+
+```{r water_tank_density, warning=FALSE}
+
+water_tank <- terra::rast("water_tank_density.tif")
+
+water_tank_values <- unique_wmel_cells %>%
+  st_transform(terra::crs(water_tank)) %>%
+  select(cell.id) %>%
+  mutate(
+    water_tank_density = exactextractr::exact_extract(
+      water_tank,
+      .,
+      fun = "mean"
+    )
+  ) %>%
+  st_drop_geometry()
+
+```
+
+#### Breeding container counts
+Source: Steffen Knoblauch
+
+```{r breeding_container_counts, warning=FALSE}
+
+# Import container point data once
+breeding_container_types <- st_read("GSV_container_counts.json", quiet = TRUE) %>%
+  st_transform(32723)
+
+# Count each container type per raster cell
+breeding_container_types_values <- unique_wmel_cells %>%
+  st_transform(st_crs(breeding_container_types)) %>%
+  select(cell.id) %>%
+  st_join(breeding_container_types) %>%
+  st_drop_geometry() %>%
+  group_by(cell.id) %>%
+  summarise(
+    across(where(is.numeric), ~ sum(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+```
+
+
+## Test water tank counts vs density
+
+```{r water_tank_count_vs_density, warning=FALSE}
+
+# Water tank count
+m_wt_count_rhs <- ~ s(neighbouring_wmel_pctg_mean_avg) + water_tank
+
+m_wt_count <- gam(
+  make_multinom_flist(m_wt_count_rhs),
+  family = multinom(K = K),
+  method = "REML",
+  data = m_df
+)
+
+# Water tank density
+m_wt_density_rhs <- ~ s(neighbouring_wmel_pctg_mean_avg) + water_tank_density
+
+m_wt_density <- gam(
+  make_multinom_flist(m_wt_density_rhs),
+  family = multinom(K = K),
+  method = "REML",
+  data = m_df
+)
+
+AIC(m_wt_count, m_wt_density)
+
+```
+
+Conclusion:
+Water tank density showed stronger support than water tank count and was retained for subsequent comparisons.
+
+
+## Test individual container types
+
+```{r test_container_type, warning=FALSE}
+
+# Combine candidate carrying-capacity predictors
+carrying_capacity <- average_neighbouring_wmel_values %>%
+  left_join(breeding_container_types_values, by = "cell.id") %>%
+  left_join(water_tank_values, by = "cell.id")
+
+carrying_capacity_predictors <- names(carrying_capacity %>% select(-cell.id))
+
+carrying_capacity_predictors_no_spatial <- setdiff(
+  carrying_capacity_predictors,
+  c("neighbouring_wmel_pctg_mean_avg", "water_tank")
+)
+
+# Import outcome
+k_wmel <- read.csv("k4_reassigned_wmel_all_2025-09-24.csv", header = TRUE) %>%
+  select(cell.id, cluster) %>%
+  filter(!is.na(cluster)) %>%
+  distinct(cell.id, .keep_all = TRUE)
+
+# Combine outcome and predictors
+m_df <- left_join(k_wmel, carrying_capacity, by = "cell.id")
+
+# Check this reference level exists before running
+m_df$cluster <- as.factor(m_df$cluster)
+m_df$cluster <- relevel(m_df$cluster, ref = "Unsuccessful")
+m_df$cluster_code <- as.numeric(m_df$cluster) - 1L
+
+K <- max(m_df$cluster_code)
+
+base_rhs <- as.formula(
+  paste(
+    "~ s(neighbouring_wmel_pctg_mean_avg) +",
+    paste(carrying_capacity_predictors_no_spatial, collapse = " + ")
+  )
+)
+
+base_rhs_first <- update(base_rhs, paste("cluster_code ~ ."))
+f_list <- list(base_rhs_first, base_rhs, base_rhs)
+
+m_container_types <- gam(
+  f_list,
+  data = m_df,
+  family = mgcv::multinom(K = K),
+  method = "ML",
+  select = TRUE,
+  na.action = na.exclude
+)
+
+AIC(m_container_types)
+summary(m_container_types)
+
+```
+
+Conclusion:
+The individual container types with strongest signal were: potted_plant, storm_drain_with_grid, and water_tank.
+These were carried forward into the main predictor-processing script as breeding_container_sum.
+

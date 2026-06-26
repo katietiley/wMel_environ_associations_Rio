@@ -1,0 +1,404 @@
+---
+title: "mulitnomial_gam_bootstrapped_model_selection"
+author: "K Tiley"
+date: "2026-05-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(dplyr)            # pipelines
+library(tidyr)            # dataframe manipulation
+library(reshape2)         # dataframe manipulation
+library(forcats)          # fct_recode()
+library(nnet)             # multinomial logistic regression
+library(mgcv)             # GAMs
+library(caret)            # regression
+library(ggplot2)          # plotting
+library(sf)               # spatial data
+library(spatialsample)    # spatial cross-validation
+library(spdep)            # spatial autocorrelation
+library(car)              # multicollinearity
+library(purrr)            # iteration (map_* etc.)
+library(rlang)
+library(tibble)
+library(stringr)
+library(ggbeeswarm)
+
+```
+
+
+## Prepare data
+
+```{r data_prep}
+
+# upload predictors
+predictors_df <- read.csv("model_predictors_df_updatedflightbarriers2025-09-30.csv", header = TRUE)
+#names(predictors_df)
+
+# upload outcome trajectories
+wmel_reassigned <- read.csv("k4_reassigned_wmel_all_2025-09-24.csv", header = TRUE)  # outcome with reassignment for decreasing slopes
+
+# prepare model dataframes
+wmel_clustered_num <- wmel_reassigned %>%
+  filter(!is.na(cluster)) %>%                                                                               # remove rows where cluster is NA
+  mutate(cluster = factor(cluster, levels = c("Unsuccessful","Low Success","Moderate Success","High Success")),
+         cluster_num = dplyr::recode(as.character(cluster), "Unsuccessful" = 3L, "Low Success" = 4L, "Moderate Success" = 2L, "High Success" = 1L,
+                                     .default = NA_integer_, .missing = NA_integer_),
+         release_zone = factor(release_zone)) %>%
+  distinct(cell.id, .keep_all = TRUE) %>%                                                                   # retain one row (and cluster label) per cell.id
+  dplyr::select(cell.id, cluster, cluster_num, x, y, release_zone)
+
+wmel_model_df <- wmel_clustered_num %>%
+  dplyr::select(cell.id, cluster, release_zone) %>%
+  left_join(predictors_df, by = "cell.id") %>%
+  mutate(across(
+    .cols = -c(cell.id, cluster, release_zone),
+    .fns = ~ replace_na(., 0)
+    ),
+    release_zone5 = release_zone,
+    release_zone = case_when(
+      release_zone5 %in% c("RJ3.1", "RJ3.2", "RJ3.3") ~ "RJ3",
+      release_zone5 == "RJ2" ~ "RJ2",
+      TRUE ~ "RJ1"
+    ),
+    release_zone = factor(release_zone)
+  )
+
+# predictor pool (exclude id, response, coords)
+predictors_og <- setdiff(
+  names(wmel_model_df),
+  c("cell.id", "cluster", "neighbouring_wmel_pctg_mean_avg", "release_zone", "release_zone5")
+)
+
+```
+
+
+## Predictors
+
+#### Tranformation for high Variance Inflation Factors (VIF)
+
+As a rule of thumb:
+-  <5 low, 5-10 moderate
+-  >10 high multicollinearity & consider removing or combining
+-  >30 severe multicollinearity & must address as model is not valid
+
+Problem: proportion_residential & proportion_non_residential
+Resolution: 'residualise' proportion_non_residential so that the non-residential buffer effect is retained without the non-residential data trends explained by proportion_residential
+How: fit a model to get residuals, but which model? -> evidence of non-linearity, so fit a GAM.
+
+```{r pred_vif_refine}
+
+aux <- mgcv::gam(proportion_non_residential ~ s(proportion_residential, k = 6), data = wmel_model_df, method = "REML")
+wmel_model_df$proportion_non_residential <- resid(aux)
+
+```
+
+
+## Scale predictors
+
+Scale predictors for comparable coefficients which tell you the expected change in log-odds per 1 SD increase in the predictor. Method: subtract predictor mean and divide by SD.
+
+```{r pred_scaled}
+
+predictors_clean2 <- c("proportion_buildings_over6m", "temp_c_mean_idw", "elevation", "rain_24h_mean_idw")
+wmel_model_df_scaled <- wmel_model_df[, c(predictors_clean2, "cell.id", "cluster", "release_zone", "neighbouring_wmel_pctg_mean_avg")] %>%
+  mutate(across(all_of(predictors_clean2), ~ as.numeric(scale(.x))))
+#summary(wmel_model_df_scaled)
+
+```
+
+
+## Model data and helper function
+
+```{r screening_df}
+
+# final model dataframe
+wmel_model_df_scaled_subset <- wmel_model_df_scaled %>%
+  dplyr::select(any_of(c(predictors_clean2, "cluster", "release_zone", "neighbouring_wmel_pctg_mean_avg")))
+df <- droplevels(wmel_model_df_scaled_subset)
+
+df$cluster <- relevel(df$cluster, ref = "Unsuccessful")
+df$cluster_code <- as.numeric(df$cluster) - 1L                                                            # recode response to integers 0..K with desired baseline as 0
+K <- max(df$cluster_code)
+f_list0 <- list(cluster_code ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone), ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone), ~s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone))
+m0 <- gam(f_list0, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)  # intercept-only reference model
+aic_base <- AIC(m0)
+
+```
+
+```{r screening_helpers}
+
+build_flist_linear <- function(
+    rhs, K, resp = "cluster_code",
+    k = 10, bs = "ts"
+    ){
+
+  # rhs  = RHS formula like ~ x1 + x2 + x3
+  # K    = number of classes
+  # resp = response variable name
+  # k    = default basis size (scalar, default 10) OR a *named* numeric vec per var
+  # bs   = basis for s(), default "ts" (thin-plate w/ shrinkage)
+  
+  stopifnot(inherits(rhs, "formula"), K >= 2)
+  
+  term_labels <- xfun::attr2(terms(rhs), "term.labels")
+  
+  pick_k <- function(v) {
+    if (length(k) > 1 && !is.null(names(k)) && v %in% names(k)) k[[v]] else as.numeric(k)[1]
+  }
+  
+  # always add the spatial proxy smooth
+#  spatial_proxy <- "s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10)"
+#  spatial_proxy <- "s(release_zone, bs='re')"
+  spatial_proxy <- "s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone)"
+
+
+  # assemble RHS (deduplicate, preserve first occurrence)
+  rhs_terms <- unique(c(term_labels, spatial_proxy))
+  rhs_new   <- as.formula(paste("~", paste(rhs_terms, collapse = " + ")))
+  
+  # mgcv multinomial formula list: first has response, rest are RHS
+  c(list(update(rhs_new, paste(resp, "~ ."))),
+    rep(list(rhs_new), K - 1))
+}
+
+```
+
+```{r forward_selection_helper}
+
+run_forward_selection <- function(df_in, predictors_clean2, K, aic_base) {
+
+  df <- droplevels(df_in)
+
+  df$cluster <- relevel(df$cluster, ref = "Unsuccessful")
+  df$cluster_code <- as.numeric(df$cluster) - 1L
+
+  # base model
+  f_list0 <- list(
+    cluster_code ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone),
+    ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone),
+    ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone)
+  )
+
+  m0 <- gam(
+    f_list0,
+    data = df,
+    family = mgcv::multinom(K = K),
+    method = "ML",
+    select = TRUE,
+    na.action = na.exclude
+  )
+
+  selected <- c()
+
+  remaining <- predictors_clean2
+
+  repeat {
+
+    best_term <- NULL
+    best_dAIC <- 0
+
+    for (x in remaining) {
+
+      f1 <- as.formula(paste("~", paste(c(selected, x), collapse = " + ")))
+      list_f <- build_flist_linear(f1, K)
+
+      m <- gam(
+        list_f,
+        data = df,
+        family = mgcv::multinom(K = K),
+        method = "ML",
+        select = TRUE,
+        na.action = na.exclude
+      )
+
+      dAIC <- AIC(m) - aic_base
+
+      if (dAIC < best_dAIC) {
+        best_dAIC <- dAIC
+        best_term <- x
+      }
+    }
+
+    if (!is.null(best_term) && best_dAIC < -2) {
+      selected <- c(selected, best_term)
+      remaining <- setdiff(remaining, best_term)
+    } else {
+      break
+    }
+  }
+
+  return(selected)
+}
+
+```
+
+## Forward selection by AIC |>2|
+
+```{r bootstrapped_forward_selection}
+
+set.seed(123)
+
+B <- 100
+boot_selected <- vector("list", B)
+
+n <- nrow(df)
+
+start_time <- Sys.time()
+
+for (b in 1:B) {
+  
+  if (b %% 5 == 0) cat("Bootstrap", b, "of", B, "\n")
+
+  idx <- sample(1:n, size = n, replace = TRUE)
+  df_b <- df[idx, ]
+
+  boot_selected[[b]] <- tryCatch(
+    run_forward_selection(
+    df_in = df_b,
+    predictors_clean2 = predictors_clean2,
+    K = K,
+    aic_base = aic_base
+  ),
+
+    error = function(e) {
+      cat(
+        "\nBootstrap", b,
+        "failed:\n",
+        conditionMessage(e), "\n"
+      )
+
+      return(NA)
+    }
+  )
+}
+
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+```{r bootstrapped_forward_selection_outputs}
+
+all_selected <- unlist(boot_selected)
+names(all_selected) <- gsub("\\.1|\\.2", "", names(all_selected))
+selection_freq <- sort(table(all_selected) / B, decreasing = TRUE)
+selection_freq_df <- data.frame(
+  covariate = names(selection_freq),
+  freq = as.numeric(selection_freq)
+)
+
+head(selection_freq_df)
+
+```
+
+```{r case_deletion_bootstrapped_forward_selection}
+
+set.seed(123)
+
+B <- 100
+boot_deletion_selected <- vector("list", B)
+
+n <- nrow(df)
+
+for (b in 1:B) {
+  
+  if (b %% 5 == 0) cat("Bootstrap", b, "of", B, "\n")
+
+  idx <- sample(1:n, size = floor(0.9 * n), replace = TRUE)
+  df_b <- df[idx, ]
+
+  boot_deletion_selected[[b]] <- tryCatch(
+    run_forward_selection(
+    df_in = df_b,
+    predictors_clean2 = predictors_clean2,
+    K = K,
+    aic_base = aic_base
+  ),
+
+    error = function(e) {
+      cat(
+        "\nBootstrap deletion", b,
+        "failed:\n",
+        conditionMessage(e), "\n"
+      )
+
+      return(NA)
+    }
+  )
+}
+
+```
+
+```{r case_deletion_bootstrapped_forward_selection_outputs}
+
+all_deletion_selected <- unlist(boot_deletion_selected)
+names(all_deletion_selected) <- gsub("\\.1|\\.2", "", names(all_deletion_selected))
+selection_deletion_freq <- sort(table(all_deletion_selected) / B, decreasing = TRUE)
+selection_deletion_freq <- data.frame(
+  covariate = names(selection_deletion_freq),
+  freq = as.numeric(selection_deletion_freq)
+)
+
+head(selection_deletion_freq)
+
+```
+
+#### Spatially structured bootstrap
+
+```{r spatial_bootstrapped_forward_selection}
+
+set.seed(123)
+
+zones <- unique(df$release_zone)
+B <- 100
+boot_spatial_selected <- vector("list", B)
+
+n <- nrow(df)
+
+for (b in 1:B) {
+  
+  if (b %% 5 == 0) cat("Bootstrap", b, "of", B, "\n")
+  
+  sampled_zones <- sample(zones, length(zones), replace = TRUE)
+  df_b <- do.call(rbind, lapply(sampled_zones, function(z) {
+    df[df$release_zone == z, ]
+  }))
+
+  boot_spatial_selected[[b]] <- tryCatch(
+    run_forward_selection(
+    df_in = df_b,
+    predictors_clean2 = predictors_clean2,
+    K = K,
+    aic_base = aic_base
+  ),
+
+    error = function(e) {
+      cat(
+        "\nBootstrap spatial", b,
+        "failed:\n",
+        conditionMessage(e), "\n"
+      )
+
+      return(NA)
+    }
+  )
+}
+
+```
+
+```{r spatial_bootstrapped_forward_selection_outputs}
+
+all_spatial_selected <- unlist(boot_spatial_selected)
+names(all_spatial_selected) <- gsub("\\.1|\\.2", "", names(all_spatial_selected))
+selection_spatial_freq <- sort(table(all_spatial_selected) / B, decreasing = TRUE)
+selection_spatial_freq <- data.frame(
+  covariate = names(selection_spatial_freq),
+  freq = as.numeric(selection_spatial_freq)
+)
+
+head(selection_spatial_freq)
+
+```
+

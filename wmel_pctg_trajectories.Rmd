@@ -1,0 +1,340 @@
+---
+title: "wmel_pctg_trajectories"
+author: "K Tiley"
+date: "2026-06-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(purrr)
+library(sf)
+
+```
+
+## Load k-means clustering outputs
+
+```{r load_data}
+
+km_out <- readRDS("wmel_kmeans_sensitivity_k3-6.rds")
+models_by_k          <- km_out$models_by_k
+kmeans_results       <- km_out$kmeans_results
+k_metrics            <- km_out$k_metrics
+trajectory_long_by_k <- km_out$trajectory_long_by_k
+
+# just extract for 4 clusters as decided from k comparison metrics in wmel_pctg_k_clustering.Rmd
+# explicitly ensure trajectory ordering
+
+cluster_lookup <- c(
+  "3" = "Unsuccessful",
+  "1" = "Low Success",
+  "2" = "Moderate Success",
+  "4" = "High Success"
+)
+
+cluster_levels <- c(
+  "Unsuccessful",
+  "Low Success",
+  "Moderate Success",
+  "High Success"
+)
+
+models_valid4 <- models_by_k[["k4"]] %>%
+  mutate(cluster = dplyr::recode(as.character(cluster), !!!cluster_lookup),
+         cluster = factor(cluster, levels = cluster_levels))
+
+trend_long <- trajectory_long_by_k  %>%
+  filter(k == "k = 4") %>%
+  mutate(cluster = dplyr::recode(as.character(cluster), !!!cluster_lookup),
+         cluster = factor(cluster, levels = cluster_levels))
+
+# sanity check number of cluster counts for both objects should be equal:
+trend_counts <- trend_long %>%
+  distinct(cell.id, cluster) %>%
+  count(cluster)
+model_counts <- models_valid4 %>%
+  ungroup() %>%
+  distinct(cell.id, cluster) %>%
+  count(cluster)
+# align and compare
+all(trend_counts$n[match(trend_counts$cluster, model_counts$cluster)] == model_counts$n)
+
+```
+
+
+## Calculate trajectory slopes and reassign
+
+```{r traj_slopes}
+
+cell_slopes <- trend_long %>%
+  group_by(cell.id) %>%
+  summarise(
+    slope = coef(lm(wmel_pctg ~ month_of_release))[2],
+    .groups = "drop"
+  )
+
+```
+
+Only reassign cells currently classified as Low, Moderate or High Success to Unsuccessful, based on slope <-0.005
+
+```{r declining_slopes}
+
+reassigned_ids <- cell_slopes %>%
+  left_join(
+    models_valid4 %>%
+      select(cell.id, cluster),
+    by = "cell.id"
+  ) %>%
+  filter(
+    slope < -0.005,
+    cluster %in% c("Low Success", "Moderate Success", "High Success")
+  ) %>%
+  pull(cell.id)
+
+reassigned_ids
+
+```
+
+```{r reassign_declining_slopes}
+
+trend_long_final <- trend_long %>%
+  mutate(
+    cluster = case_when(
+      cell.id %in% reassigned_ids ~ "Unsuccessful",
+      TRUE ~ as.character(cluster)
+    ),
+    cluster = factor(cluster, levels = levels(trend_long$cluster))
+  )
+
+models_valid4_final <- models_valid4 %>%
+  left_join(cell_slopes, by = "cell.id") %>%
+  mutate(
+    cluster = case_when(
+      cell.id %in% reassigned_ids ~ "Unsuccessful",
+      TRUE ~ cluster
+    )
+  )
+
+```
+
+Sanity check: compare old vs new cluster assignments
+
+```{r compare_old_vs_new}
+
+old_counts <- models_valid4 %>%
+  ungroup() %>%
+  distinct(cell.id, cluster) %>%
+  count(cluster, name = "old_n_cells")
+
+new_counts <- models_valid4_final %>%
+  ungroup() %>%
+  distinct(cell.id, cluster) %>%
+  count(cluster, name = "n_cells")
+
+cluster_counts <- full_join(
+  old_counts,
+  new_counts,
+  by = "cluster"
+) %>%
+  mutate(change = n_cells - old_n_cells,
+         cluster = factor(cluster, levels = cluster_levels)) %>%
+  arrange(cluster)
+cluster_counts
+
+```
+
+## Plot trajectories
+
+#### Figure 2. Trajectories in proportion wMel over release period
+
+```{r traj_plot, fig.height=5, fig.width=9, warning=FALSE}
+
+cluster_colours <- c(
+  "Unsuccessful" = "#E6E482",
+  "Low Success" = "#95C164",
+  "Moderate Success" = "#428643",
+  "High Success" = "#1B561F"
+)
+
+cluster_trajectories_plot <- ggplot(trend_long, aes(x = month_of_release, y = wmel_pctg, group = cell.id)) +
+  geom_line(aes(colour = cluster), linewidth = 0.5, alpha = 0.4) +
+  stat_summary(aes(group = cluster), fun = mean, geom = "line", colour = "black", linewidth = 0.9) +
+  facet_wrap(~cluster, ncol = 4) +
+  scale_color_manual(values = cluster_colours) +
+  geom_text(data = cluster_counts, aes(label = paste0("n = ", old_n_cells)), x = 13, y = 1.04, inherit.aes = FALSE, size = 3.5) +
+  coord_cartesian(ylim = c(0, 1.05)) +
+  scale_x_continuous(breaks = seq(0, 25, by = 5)) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 13)) +
+  labs(x = "Month of Release", y = "Proportion wMel")
+
+cluster_trajectories_plot
+
+```
+
+#### Supplementary Figure 1. Raster cell trajectories which were reassigned to unsuccessful
+Reassigned cells highlighted:
+
+```{r reassigned_traj_highlighted_plot, fig.height=5, fig.width=9, warning=FALSE}
+
+trend_long_plot <- trend_long %>%
+  mutate(plot_group = ifelse(cell.id %in% reassigned_ids, "Reassigned", as.character(cluster)))
+
+cluster_trajectories_highlighted_plot <- ggplot(trend_long_plot, aes(x = month_of_release, y = wmel_pctg, group = cell.id)) +
+  geom_line(aes(colour = plot_group), linewidth = 0.5, alpha = 0.4) +
+  geom_line(data = subset(trend_long_plot, plot_group == "Reassigned"), colour = "red3", linewidth = 0.5, alpha = 1) + # reassigned cells (highlighted, solid + red)
+  stat_summary(aes(group = cluster), fun = mean, geom = "line", colour = "black", linewidth = 0.9) +
+  facet_wrap(~cluster, ncol = 4) +
+  scale_color_manual(values = cluster_colours) +
+  geom_text(data = cluster_counts, aes(label = paste0("n = ", old_n_cells)), x = 13, y = 1.04, inherit.aes = FALSE, size = 3.5) +
+  coord_cartesian(ylim = c(0, 1.05)) +
+  scale_x_continuous(breaks = seq(0, 25, by = 5)) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 13)) +
+  labs(x = "Month of Release", y = "Proportion wMel")
+
+cluster_trajectories_highlighted_plot
+
+```
+
+```{r reassigned_cluster_map, fig.height=6, fig.width=8, warning=FALSE}
+
+# cluster dataframe with coordinates
+wmel_k4_reassigned <- read.csv("k4_reassigned_wmel_all_2025-09-24.csv")
+map_plot_df <- wmel_k4_reassigned %>% filter(!is.na(cluster)) %>% group_by(cell.id) %>% slice(1) %>%
+  mutate(cluster = factor(cluster, levels = c("Unsuccessful", "Low Success", "Moderate Success", "High Success")))
+reassigned_cells <- map_plot_df %>%
+  filter(cell.id %in% reassigned_ids)
+
+# bbox for deployment area
+bb_xy <- map_plot_df |>
+  dplyr::distinct(cell.id, x, y) |>
+  st_as_sf(coords = c("x","y"), crs = 32723) |>
+  st_bbox()
+
+# RJ city polygon
+#muni_rj_ll <- geobr::read_municipality(code_muni = "RJ", year = 2020, simplified = TRUE)
+#saveRDS(muni_rj_ll, "muni_rj_2020.rds")
+muni_rj_ll <- readRDS("muni_rj_2020.rds")
+rio_city_ll <- dplyr::filter(muni_rj_ll, name_muni == "Rio de Janeiro")
+neighbour1_ll <- dplyr::filter(muni_rj_ll, name_muni == "São João de Meriti")
+neighbour2_ll <- dplyr::filter(muni_rj_ll, name_muni == "Duque de Caxias")
+
+# RJ state and other administrative polygons
+#states_br_ll <- geobr::read_state(year = 2020, simplified = TRUE)
+#saveRDS(states_br_ll, "states_br_2020.rds")
+states_br_ll <- readRDS("states_br_2020.rds")
+rj_state_ll  <- dplyr::filter(states_br_ll, abbrev_state == "RJ")
+# fallback: rnaturalearth states (needs rnaturalearth + rnaturalearthdata)
+#states_br_ll <- rnaturalearth::ne_states(country = "Brazil", returnclass = "sf")
+#rj_state_ll  <- dplyr::filter(states_br_ll, name %in% c("Rio de Janeiro", "Rio de Janeiro State"))
+
+# clusters map
+clusters_map <- ggplot() +
+  geom_sf(data = neighbour1_ll,  fill = "white", color = "grey40", linewidth = 0.2) +
+  geom_sf(data = neighbour2_ll,  fill = "white", color = "grey40", linewidth = 0.2) +
+  geom_sf(data = rio_city_ll,  fill = "white",     color = "black", linewidth = 0.5) +
+  geom_raster(data = map_plot_df, aes(x = x, y = y, fill = cluster)) +
+  geom_raster(data = reassigned_cells, aes(x = x, y = y), fill = "red3") +
+  geom_text(aes(x = 686500, y = 7471500, label = "Atlantic\nOcean"), size = 3.8, fontface = "bold", color = "black") +
+  geom_text(aes(x = 672000, y = 7470500, label = "Municipality of\nRio de Janeiro"), size = 3.8, fontface = "bold", color = "black") +
+  coord_sf(crs = 32723,
+           xlim = c(bb_xy["xmin"], bb_xy["xmax"] + 180),
+           ylim = c(bb_xy["ymin"], bb_xy["ymax"] + 850)) +
+  scale_fill_manual(values = cluster_colours, na.value = "grey70") +
+  labs(x = NULL, y = NULL, fill = NULL) +
+  theme_minimal() + 
+  theme(
+    panel.background = element_rect(fill = "#cfe8f3", colour = NA), # light blue ocean
+    legend.position = c(0.98, 0.115),
+    legend.justification = c(1, 0),
+    legend.background = element_rect(fill = "white", colour = "grey60"),
+    legend.box.margin = margin(4, 6, 4, 6),
+    legend.key.height = unit(10, "pt"),
+    legend.key.width  = unit(14, "pt")
+  )
+clusters_map
+
+```
+
+
+## Plot trajectories with reassigned cells
+
+```{r reassigned_traj_plot, fig.height=5, fig.width=9, warning=FALSE}
+
+cluster_trajectories_reassigned_plot <- ggplot(trend_long_final, aes(x = month_of_release, y = wmel_pctg, group = cell.id)) +
+  geom_line(aes(colour = cluster), linewidth = 0.5, alpha = 0.4) +
+  stat_summary(aes(group = cluster), fun = mean, geom = "line", colour = "black", linewidth = 0.9) +
+  facet_wrap(~cluster, ncol = 4) +
+  scale_color_manual(values = cluster_colours) +
+  geom_text(data = cluster_counts, aes(label = paste0("n = ", n_cells)), x = 13, y = 1.04, inherit.aes = FALSE, size = 3.5) +
+  coord_cartesian(ylim = c(0, 1.05)) +
+  scale_x_continuous(breaks = seq(0, 25, by = 5)) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 13)) +
+  labs(x = "Month of Release", y = "Proportion wMel")
+
+cluster_trajectories_reassigned_plot
+
+```
+
+#### Manuscript Figure 3. Map of raster cells by replacement trajectory
+
+```{r cluster_map, fig.height=6, fig.width=8, warning=FALSE}
+
+# bbox for deployment area
+bb_xy <- map_plot_df |>
+  dplyr::distinct(cell.id, x, y) |>
+  st_as_sf(coords = c("x","y"), crs = 32723) |>
+  st_bbox()
+
+# RJ city polygon
+#muni_rj_ll <- geobr::read_municipality(code_muni = "RJ", year = 2020, simplified = TRUE)
+#saveRDS(muni_rj_ll, "muni_rj_2020.rds")
+muni_rj_ll <- readRDS("muni_rj_2020.rds")
+rio_city_ll <- dplyr::filter(muni_rj_ll, name_muni == "Rio de Janeiro")
+neighbour1_ll <- dplyr::filter(muni_rj_ll, name_muni == "São João de Meriti")
+neighbour2_ll <- dplyr::filter(muni_rj_ll, name_muni == "Duque de Caxias")
+
+# RJ state and other administrative polygons
+#states_br_ll <- geobr::read_state(year = 2020, simplified = TRUE)
+#saveRDS(states_br_ll, "states_br_2020.rds")
+states_br_ll <- readRDS("states_br_2020.rds")
+rj_state_ll  <- dplyr::filter(states_br_ll, abbrev_state == "RJ")
+# fallback: rnaturalearth states (needs rnaturalearth + rnaturalearthdata)
+#states_br_ll <- rnaturalearth::ne_states(country = "Brazil", returnclass = "sf")
+#rj_state_ll  <- dplyr::filter(states_br_ll, name %in% c("Rio de Janeiro", "Rio de Janeiro State"))
+
+# clusters map
+clusters_map <- ggplot() +
+  geom_sf(data = neighbour1_ll,  fill = "white", color = "grey40", linewidth = 0.2) +
+  geom_sf(data = neighbour2_ll,  fill = "white", color = "grey40", linewidth = 0.2) +
+  geom_sf(data = rio_city_ll,  fill = "white",     color = "black", linewidth = 0.5) +
+  geom_raster(data = map_plot_df, aes(x = x, y = y, fill = cluster)) +
+  geom_text(aes(x = 686500, y = 7471500, label = "Atlantic\nOcean"), size = 3.8, fontface = "bold", color = "black") +
+  geom_text(aes(x = 672000, y = 7470500, label = "Municipality of\nRio de Janeiro"), size = 3.8, fontface = "bold", color = "black") +
+  coord_sf(crs = 32723,
+           xlim = c(bb_xy["xmin"], bb_xy["xmax"] + 180),
+           ylim = c(bb_xy["ymin"], bb_xy["ymax"] + 850)) +
+  scale_fill_manual(values = cluster_colours, na.value = "grey70") +
+  labs(x = NULL, y = NULL, fill = NULL) +
+  theme_minimal() + 
+  theme(
+    panel.background = element_rect(fill = "#cfe8f3", colour = NA), # light blue ocean
+    legend.position = c(0.98, 0.115),
+    legend.justification = c(1, 0),
+    legend.background = element_rect(fill = "white", colour = "grey60"),
+    legend.box.margin = margin(4, 6, 4, 6),
+    legend.key.height = unit(10, "pt"),
+    legend.key.width  = unit(14, "pt")
+  )
+clusters_map
+
+```
+

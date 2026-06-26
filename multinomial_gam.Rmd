@@ -1,0 +1,1053 @@
+---
+title: "mulitnomial_gam_2026-05-15"
+author: "K Tiley"
+date: "2026-05-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(dplyr)            # pipelines
+library(tidyr)            # dataframe manipulation
+library(reshape2)         # dataframe manipulation
+library(forcats)          # fct_recode()
+library(nnet)             # multinomial logistic regression
+library(mgcv)             # GAMs
+library(caret)            # regression
+library(ggplot2)          # plotting
+library(sf)               # spatial data
+library(spatialsample)    # spatial cross-validation
+library(spdep)            # spatial autocorrelation
+library(car)              # multicollinearity
+library(purrr)            # iteration (map_* etc.)
+library(rlang)
+library(tibble)
+library(stringr)
+library(ggbeeswarm)
+
+```
+
+
+## Prepare data
+
+```{r data_prep}
+
+# upload predictors
+predictors_df <- read.csv("model_predictors_df_updatedflightbarriers2025-09-30.csv", header = TRUE)
+#names(predictors_df)
+
+# upload outcome trajectories
+wmel_reassigned <- read.csv("k4_reassigned_wmel_all_2025-09-24.csv", header = TRUE)  # outcome with reassignment for decreasing slopes
+
+# prepare model dataframes
+wmel_clustered_num <- wmel_reassigned %>%
+  filter(!is.na(cluster)) %>%                                                                               # remove rows where cluster is NA
+  mutate(cluster = factor(cluster, levels = c("Unsuccessful","Low Success","Moderate Success","High Success")),
+         cluster_num = dplyr::recode(as.character(cluster), "Unsuccessful" = 3L, "Low Success" = 4L, "Moderate Success" = 2L, "High Success" = 1L,
+                                     .default = NA_integer_, .missing = NA_integer_),
+         release_zone = factor(release_zone)) %>%
+  distinct(cell.id, .keep_all = TRUE) %>%                                                                   # retain one row (and cluster label) per cell.id
+  dplyr::select(cell.id, cluster, cluster_num, x, y, release_zone)
+
+wmel_model_df <- wmel_clustered_num %>%
+  dplyr::select(cell.id, cluster, release_zone) %>%
+  left_join(predictors_df, by = "cell.id") %>%
+  mutate(across(
+    .cols = -c(cell.id, cluster, release_zone),
+    .fns = ~ replace_na(., 0)
+    ),
+    release_zone5 = release_zone,
+    release_zone = case_when(
+      release_zone5 %in% c("RJ3.1", "RJ3.2", "RJ3.3") ~ "RJ3",
+      release_zone5 == "RJ2" ~ "RJ2",
+      TRUE ~ "RJ1"
+    ),
+    release_zone = factor(release_zone)
+  )
+
+# predictor pool (exclude id, response, coords)
+predictors_og <- setdiff(
+  names(wmel_model_df),
+  c("cell.id", "cluster", "neighbouring_wmel_pctg_mean_avg", "release_zone", "release_zone5")
+)
+
+```
+
+
+## Check baseline spatial autocorrelation
+
+Monte Carlo join-count test (for categorical variables, Moran's I is for continuous variables)
+    Significant positive joins = same-cluster neighbours greater than expected under randomness = spatial clustering of the outcome
+
+Note: using points instead of polygons is acceptable in this case as I set neighbour distance at 800m. For 500 x 500 m raster cells the distance to rook neighbours = 500m and queen neighbours = ~707m
+
+```{r spatial_autocorrelation, warning=FALSE}
+
+wmel_clustered_sf <- st_as_sf(wmel_clustered_num, coords = c("x", "y"), crs = 32723)                      # add geometries
+#plot(st_geometry(wmel_clustered_sf), col = 'grey70')                                                      # sanity check:- geometries look ok
+coords <- st_coordinates(wmel_clustered_sf)                                                               # get coords for spatial weighting
+nb <- dnearneigh(coords, d1 = 0, d2 = 800)                                                                # distance-based neighbours: within 800 m
+nb_k1 <- knn2nb(knearneigh(coords, k = 1))                                                                # list of neighbours number
+nb_fix <- union.nb(nb, nb_k1)                                                                            # add one nearest-neighbour to any 'islands' (isolated cells)
+cat("sanity check:- no zeros:\n")
+table(card(nb_fix))
+lw <- nb2listw(nb_fix, style = "W")                                                                       # build spatial weights
+set.seed(1)
+pvals <- c(                                                                                                # extracted p-value for TRUE (within specified cluster)
+  joincount.mc(factor(wmel_clustered_sf$cluster %in% "Unsuccessful"), lw, nsim=999)[[2]]$p.value,
+  joincount.mc(factor(wmel_clustered_sf$cluster %in% "Low Success"), lw, nsim=999)[[2]]$p.value,
+  joincount.mc(factor(wmel_clustered_sf$cluster %in% "Moderate Success"), lw, nsim=999)[[2]]$p.value,
+  joincount.mc(factor(wmel_clustered_sf$cluster %in% "High Success"), lw, nsim=999)[[2]]$p.value)
+pvals_FDR <- p.adjust(pvals, "fdr")                                                                       # adjusted for False Discovery Rate (since doing multiple tests)
+cat("\nFDR-adjusted join-count test p-values:\n")
+print(pvals_FDR)
+
+```
+Statistical significance indicates strong spatial autocorrelation and justifies a smoothed spatial term.
+
+
+## Predictor selection
+
+#### a) Check for zero variance
+
+```{r pred_variance}
+
+nzv_vars <- nearZeroVar(wmel_model_df[, predictors_og], saveMetrics = TRUE) %>% filter(nzv == TRUE)
+print(nzv_vars)
+
+```
+
+```{r pred_variance_refine}
+
+# REMOVE zero variance predictors
+nzv_vars_remove <- nzv_vars %>%
+  filter(nzv == TRUE) %>%
+  rownames()
+predictors_clean1 <- setdiff(predictors_og, nzv_vars_remove)
+
+```
+
+#### b) Check for multicollinearity
+
+```{r pred_multicollinearity}
+
+cor_matrix <- cor(wmel_model_df[, predictors_clean1], use = "pairwise.complete.obs")
+cor_matrix[upper.tri(cor_matrix, diag = TRUE)] <- NA                                                      # exclude diagonal and duplicates
+cor_long <- as.data.frame(as.table(cor_matrix)) %>%                                                       # convert to long for easier filtering
+  filter(!is.na(Freq)) %>%
+  arrange(desc(abs(Freq)))
+high_corr_pairs <- cor_long %>% filter(abs(Freq) > 0.8)                                                   # show pairs with |correlation| > 0.8
+high_corr_pairs
+
+```
+
+```{r pred_multicollinearity_refine}
+
+# REMOVE collinear predictors based on keeping most biologically important per pair
+drops <- c("average_literacy","humidity_mean_idw","built_volume_density")
+predictors_clean2 <- setdiff(predictors_clean1, drops)
+
+```
+
+```{r pred_multicollinearity_plot, fig.height=8, fig.width=10, warning=FALSE}
+
+cor_matrix_drops <- cor(wmel_model_df[, predictors_clean2], use = "pairwise.complete.obs")
+cor_matrix_drops[upper.tri(cor_matrix_drops, diag = TRUE)] <- NA                                          # exclude diagonal and duplicates
+cor_melt <- melt(cor_matrix_drops, varnames = c("Var1", "Var2"))                                           # melt to long format
+cor_melt <- cor_melt %>%
+  mutate(label = ifelse(abs(value) >= 0.3, round(value, 2), ""))                                            # create column for labels where absolute value >= 0.6
+corr_plot <- ggplot(cor_melt, aes(Var1, Var2, fill = value)) +                                              # plot corrplot with labelled correlation coefficients
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab") +
+  geom_text(aes(label = label), color = "black", size = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  coord_fixed() +
+  ggtitle("Correlation Matrix (Labels > |0.3|)")
+corr_plot
+
+```
+
+#### c) Check for high Variance Inflation Factors (VIF)
+
+As a rule of thumb:
+-  <5 low, 5-10 moderate
+-  >10 high multicollinearity & consider removing or combining
+-  >30 severe multicollinearity & must address as model is not valid
+
+```{r pred_vif}
+
+lm_vif_test <- lm(as.numeric(cluster) ~ ., data = wmel_model_df[, c("cluster", predictors_clean2)])
+vif_values <- car::vif(lm_vif_test)
+vif_values
+
+```
+
+Problem: proportion_residential & proportion_non_residential
+Resolution: 'residualise' proportion_non_residential so that the non-residential buffer effect is retained without the non-residential data trends explained by proportion_residential
+How: fit a model to get residuals, but which model? -> lm preferred unless curvature then gam needed
+
+```{r tester}
+
+# a) visually curves away from the line, indicates non-linear
+ggplot(wmel_model_df, aes(x = proportion_residential, y = proportion_non_residential)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", se = FALSE, linetype = 2, linewidth = 0.8, color = "black") +
+  geom_smooth(method = mgcv::gam, formula = y ~ s(x, k = 6), se = FALSE, linewidth = 1)
+# b) the proportion_residential smooth term is significantly better than the linear predictor, indicates non-linear
+m_lin <- gam(proportion_non_residential ~ proportion_residential, data = wmel_model_df, method = "ML")
+m_spl <- gam(proportion_non_residential ~ s(proportion_residential, k = 10), data = wmel_model_df, method = "ML")
+AIC(m_lin,m_spl)
+# c) edf greater than 1 indicates non-linear, non-significant p-value indicates k isn't too small
+gam.check(m_spl)
+
+
+```
+
+Evidence of non-linearity, so fit a GAM.
+
+```{r pred_vif_refine}
+
+# how: fit a quick model to get residuals -> gam
+aux <- mgcv::gam(proportion_non_residential ~ s(proportion_residential, k = 6), data = wmel_model_df, method = "REML")
+wmel_model_df$proportion_non_residential <- resid(aux)
+# problem resolved in vif?
+lm_vif_test <- lm(as.numeric(cluster) ~ ., data = wmel_model_df[, c("cluster", predictors_clean2)])
+vif_values <- car::vif(lm_vif_test)
+vif_values
+
+```
+
+
+## Scale predictors
+
+Scale predictors for comparable coefficients which tell you the expected change in log-odds per 1 SD increase in the predictor. Method: subtract predictor mean and divide by SD.
+
+```{r pred_scaled}
+
+wmel_model_df_scaled <- wmel_model_df[, c(predictors_clean2, "cell.id", "cluster", "release_zone", "neighbouring_wmel_pctg_mean_avg")] %>%
+  mutate(across(all_of(predictors_clean2), ~ as.numeric(scale(.x))))
+#summary(wmel_model_df_scaled)
+
+```
+
+
+## Model screening
+
+```{r screening_df}
+
+# final model dataframe
+wmel_model_df_scaled_subset <- wmel_model_df_scaled %>%
+  dplyr::select(any_of(c(predictors_clean2, "cluster", "release_zone", "neighbouring_wmel_pctg_mean_avg")))
+df <- droplevels(wmel_model_df_scaled_subset)
+
+df$cluster <- relevel(df$cluster, ref = "Unsuccessful")
+df$cluster_code <- as.numeric(df$cluster) - 1L                                                            # recode response to integers 0..K with desired baseline as 0
+K <- max(df$cluster_code)
+f_list0 <- list(cluster_code ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone), ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone), ~s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone))
+m0 <- gam(f_list0, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)  # intercept-only reference model
+aic_base <- AIC(m0)
+
+```
+
+```{r screening_helpers}
+
+build_flist_linear <- function(
+    rhs, K, resp = "cluster_code",
+    k = 10, bs = "ts"
+    ){
+
+  # rhs  = RHS formula like ~ x1 + x2 + x3
+  # K    = number of classes
+  # resp = response variable name
+  # k    = default basis size (scalar, default 10) OR a *named* numeric vec per var
+  # bs   = basis for s(), default "ts" (thin-plate w/ shrinkage)
+  
+  stopifnot(inherits(rhs, "formula"), K >= 2)
+  
+  term_labels <- xfun::attr2(terms(rhs), "term.labels")
+  
+  pick_k <- function(v) {
+    if (length(k) > 1 && !is.null(names(k)) && v %in% names(k)) k[[v]] else as.numeric(k)[1]
+  }
+  
+  # always add the spatial proxy smooth
+#  spatial_proxy <- "s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10)"
+#  spatial_proxy <- "s(release_zone, bs='re')"
+  spatial_proxy <- "s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone)"
+
+
+  # assemble RHS (deduplicate, preserve first occurrence)
+  rhs_terms <- unique(c(term_labels, spatial_proxy))
+  rhs_new   <- as.formula(paste("~", paste(rhs_terms, collapse = " + ")))
+  
+  # mgcv multinomial formula list: first has response, rest are RHS
+  c(list(update(rhs_new, paste(resp, "~ ."))),
+    rep(list(rhs_new), K - 1))
+}
+
+```
+
+
+## Forward selection by AIC |>2|
+
+```{r forward_selection_1}
+
+univariate_tbl_1 <- lapply(predictors_clean2, function(x){
+  f1 <- as.formula(paste("~", x))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_1)
+choose1 <- if (univariate_tbl_1$dAIC[1] < -2) univariate_tbl_1$term[1] else NULL
+predictors_1 <- if (is.null(choose1)) stop("STOP, no new predictor chosen") else setdiff(predictors_clean2, choose1)
+
+```
+
+```{r forward_selection_2}
+
+base_rhs_1 <- as.formula(paste("~", choose1))
+base_flist_1 <- build_flist_linear(base_rhs_1, K)
+aic_base_1 <- AIC(mgcv::gam(base_flist_1, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude))
+
+univariate_tbl_2 <- lapply(predictors_1, function(x){
+  f1 <- update(base_rhs_1, as.formula(paste("~ . +", x)))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base_1)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_2)
+choose2 <- if (univariate_tbl_2$dAIC[1] < -2) univariate_tbl_2$term[1] else NULL
+predictors_2 <- if (is.null(choose2)) stop("STOP, no new predictor chosen") else setdiff(predictors_1, choose2)
+
+```
+
+```{r forward_selection_3}
+
+base_rhs_2 <- update(base_rhs_1, as.formula(paste("~ . +", choose2)))
+base_flist_2 <- build_flist_linear(base_rhs_2, K)
+aic_base_2 <- AIC(mgcv::gam(base_flist_2, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude))
+
+univariate_tbl_3 <- lapply(predictors_2, function(x){
+  f1 <- update(base_rhs_2, as.formula(paste("~ . +", x)))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base_2)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_3)
+choose3 <- if (univariate_tbl_3$dAIC[1] < -2) univariate_tbl_3$term[1] else NULL
+predictors_3 <- if (is.null(choose3)) stop("STOP, no new predictor chosen") else setdiff(predictors_2, choose3)
+
+```
+
+```{r forward_selection_4}
+
+base_rhs_3 <- update(base_rhs_2, as.formula(paste("~ . +", choose3)))
+base_flist_3 <- build_flist_linear(base_rhs_3, K)
+aic_base_3 <- AIC(mgcv::gam(base_flist_3, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude))
+
+univariate_tbl_4 <- lapply(predictors_3, function(x){
+  f1 <- update(base_rhs_3, as.formula(paste("~ . +", x)))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base_3)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_4)
+choose4 <- if (univariate_tbl_4$dAIC[1] < -2) univariate_tbl_4$term[1] else NULL
+predictors_4 <- if (is.null(choose4)) stop("STOP, no new predictor chosen") else setdiff(predictors_3, choose4)
+
+```
+
+```{r forward_selection_5}
+
+base_rhs_4 <- update(base_rhs_3, as.formula(paste("~ . +", choose4)))
+base_flist_4 <- build_flist_linear(base_rhs_4, K)
+aic_base_4 <- AIC(mgcv::gam(base_flist_4, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude))
+
+univariate_tbl_5 <- lapply(predictors_4, function(x){
+  f1 <- update(base_rhs_4, as.formula(paste("~ . +", x)))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base_4)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_5)
+choose5 <- if (univariate_tbl_5$dAIC[1] < -2) univariate_tbl_5$term[1] else NULL
+predictors_5 <- if (is.null(choose5)) stop("STOP, no new predictor chosen") else setdiff(predictors_4, choose5)
+
+```
+
+```{r forward_selection_6}
+
+base_rhs_5 <- update(base_rhs_4, as.formula(paste("~ . +", choose5)))
+base_flist_5 <- build_flist_linear(base_rhs_5, K)
+aic_base_5 <- AIC(mgcv::gam(base_flist_5, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude))
+
+univariate_tbl_6 <- lapply(predictors_5, function(x){
+  f1 <- update(base_rhs_5, as.formula(paste("~ . +", x)))
+  list_f <- build_flist_linear(f1, K)
+  m <- gam(list_f, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)
+  data.frame(term = x, AIC  = AIC(m), dAIC = AIC(m) - aic_base_5)
+}) %>% bind_rows() %>% arrange(AIC)
+head(univariate_tbl_6)
+choose6 <- if (univariate_tbl_6$dAIC[1] < -2) univariate_tbl_6$term[1] else NULL # "average_household_income"
+predictors_6 <- if (is.null(choose6)) stop("STOP, no new predictor chosen") else setdiff(predictors_5, choose6)
+
+```
+
+
+## Selected model
+
+```{r best_model}
+
+best_rhs <- base_rhs_4
+best_flist <- build_flist_linear(best_rhs, K)
+best_model <- mgcv::gam(best_flist, data = df, family = mgcv::multinom(K = K), method = "REML", select = TRUE, na.action = na.exclude)
+print(summary(best_model))
+
+cat("\nBest_model AIC:\n")
+print(AIC(best_model))
+
+```
+
+95%CIs from model summary SE:
+```{r model_95pct_CI}
+
+# extract parametric coefficient table
+coef_summary <- summary(best_model) # model summary
+coef_betas <- coef_summary$p.coeff # just betas
+coef_SEs <- coef_summary$se # just standard errors
+param_SEs <- coef_SEs[names(coef_SEs) %in% names(coef_betas)] # keep only SE values with names matching the parametric coefficient names (not spatial smooths)
+coef_ps <- coef_summary$p.pv # just p-values
+# 95% CI using normal approximation
+zcrit <- qnorm(1 - 0.05/2)  # 1.96 for 95% CI
+# make summary table with 95%CI
+coef_tab_ci <- cbind(
+  coef_betas,
+  param_SEs,
+  CI_lower = coef_betas - zcrit * param_SEs,
+  CI_upper = coef_betas + zcrit * param_SEs,
+  coef_ps
+)
+coef_tab_ci
+
+```
+
+#### Confusion martrix
+
+Confusion matrix: observed vs predicted clusters
+```{r confusion_matrix}
+
+levs <- levels(wmel_model_df_scaled$cluster)                                                              # assign levels
+predicted_probs <- predict(best_model, type = "response")                                                  # calculate residuals per cluster
+colnames(predicted_probs) <- levs                                                                         # assign colnames
+predicted_class <- factor(colnames(predicted_probs)[max.col(predicted_probs, ties.method = "first")], levels = levs)  # predicted clusters
+observed_class <- factor(wmel_model_df_scaled$cluster, levels = levs)                                    # observed clusters
+confusion_matrix <- caret::confusionMatrix(predicted_class, observed_class)
+confusion_matrix
+
+```
+
+#### Baseline probabilities of each trajectory group
+
+Average predictors and trajectories by release zone:
+```{r baseline_probabilities_by_release_zone}
+
+# scaled - must be scaled to provide interpretable outputs from predict() because the model was fitted to scaled data
+scaled_baseline_data <- df %>%
+  group_by(release_zone) %>%
+  summarise(proportion_buildings_over6m = median(proportion_buildings_over6m, na.rm = TRUE),
+            temp_c_mean_idw = median(temp_c_mean_idw, na.rm = TRUE),
+            elevation = median(elevation, na.rm = TRUE),
+            rain_24h_mean_idw = median(rain_24h_mean_idw, na.rm = TRUE),
+            neighbouring_wmel_pctg_mean_avg = median(neighbouring_wmel_pctg_mean_avg, na.rm = TRUE),
+            .groups = "drop")
+# calculate baseline probabilities of each trajctory based on covariate averages
+pred_baseline <- predict(
+  best_model,
+  newdata = scaled_baseline_data,
+  type = "response"
+)
+pred_average_baseline <- scaled_baseline_data %>%
+  bind_cols(as.data.frame(pred_baseline)) %>%
+  rename(
+    Unsuccessful = V1,
+    Low_Success = V2,
+    Moderate_Success = V3,
+    High_Success = V4
+  )
+pred_average_baseline
+
+```
+
+Average trajectories for whole deployment area:
+```{r baseline_probabilities_by_release_area}
+
+# What about overall probabilities not by release zone?
+# create a tibble with probabilities and weights (number of cells per zone)
+pred_by_zone <- tibble(
+  release_zone = c("RJ1", "RJ2", "RJ3"),
+  Unsuccessful   = c(0.102, 0.200, 0.285),
+  Low_Success    = c(0.151, 0.401, 0.584),
+  Moderate_Success = c(0.618, 0.356, 0.091),
+  High_Success   = c(0.129, 0.044, 0.040),
+  n_cells        = c(48, 42, 177)  # weights
+)
+# compute weighted average for each trajectory
+area_wide_probs <- pred_by_zone %>%
+  summarise(
+    Unsuccessful    = sum(Unsuccessful    * n_cells) / sum(n_cells),
+    Low_Success     = sum(Low_Success     * n_cells) / sum(n_cells),
+    Moderate_Success = sum(Moderate_Success * n_cells) / sum(n_cells),
+    High_Success    = sum(High_Success    * n_cells) / sum(n_cells)
+  )
+area_wide_probs
+
+```
+
+#### Spatial autocorrelation of model residuals
+
+```{r spatial_autocorrelation_residuals}
+
+# model residuals spatial autocorrelation
+set.seed(1)
+for (k in levs) {                                                                                          # Moran's I test
+  r_k <- as.numeric(wmel_model_df_scaled$cluster == k) - predicted_probs[,k]
+  # keep only rows with finite residuals
+  ok <- is.finite(r_k)
+  if (sum(ok) < 3) {
+    cat("\nMoran's I for class:", k, " — skipped (<3 obs after NA removal)\n")
+    next
+  }
+  # subset weights to the same indices
+  r_use  <- r_k[ok]
+  lw_use <- spdep::subset.listw(lw, ok)
+  # calculate Moran's I
+  cat("\nMoran’s I for class:", k, "\n")
+  print(moran.mc(r_use, lw_use, nsim = 999))
+}
+
+```
+
+#### Figure 4. Trajectory probability of selected model covariates
+Figure: PD curves
+
+```{r pd_curve, fig.height=10, fig.width=8, warning=FALSE}
+
+## 1) Store means & sds from the original (unscaled) data
+scaler <- tibble::tibble(
+  var  = predictors_clean2,
+  mean = vapply(wmel_model_df[predictors_clean2], function(x) mean(x, na.rm=TRUE), numeric(1)),
+  sd   = vapply(wmel_model_df[predictors_clean2], function(x)   sd(x, na.rm=TRUE), numeric(1))
+)
+
+to_z <- function(x, v) {
+  m <- scaler$mean[match(v, scaler$var)]
+  s <- scaler$sd  [match(v, scaler$var)]
+  (x - m) / s
+}
+
+## 2) Helper: build a prediction grid for one focal variable (in natural units)
+predict_pd_nat <- function(model, var, n = 200,
+                           hold_fun = median,
+                           df_unscaled = wmel_model_df,
+                           scaled_vars = predictors_clean2,
+                           class_levels = levels(df_unscaled$cluster),
+                           nsim = 1000,
+                           seed = 123) {
+  
+  set.seed(seed)
+  
+  rng <- range(df_unscaled[[var]], na.rm = TRUE)
+  grid_nat <- tibble::tibble(!!var := seq(rng[1], rng[2], length.out = n))
+  
+  others <- setdiff(scaled_vars, var)
+  hold_nat <- df_unscaled |>
+    dplyr::summarise(
+      dplyr::across(dplyr::all_of(others), ~hold_fun(.x, na.rm = TRUE))
+    )
+  
+  newd_nat <- tidyr::crossing(grid_nat, hold_nat)
+  
+  newd_scaled <- newd_nat
+  for (v in scaled_vars) {
+    newd_scaled[[v]] <- to_z(newd_nat[[v]], v)
+  }
+  
+  if ("neighbouring_wmel_pctg_mean_avg" %in% names(df_unscaled)) {
+    newd_scaled$neighbouring_wmel_pctg_mean_avg <-
+      hold_fun(df_unscaled$neighbouring_wmel_pctg_mean_avg, na.rm = TRUE)
+  }
+  
+  if ("release_zone" %in% names(df_unscaled)) {
+    newd_scaled$release_zone <- stats::na.omit(df_unscaled$release_zone)[1]
+  }
+  
+  ## Fitted class probabilities
+  pr <- as.data.frame(predict(model, newdata = newd_scaled, type = "response"))
+  names(pr) <- class_levels
+  
+  ## Link-scale predictions and SEs
+  lp <- predict(model, newdata = newd_scaled, type = "link", se.fit = TRUE)
+  
+  eta_hat <- as.matrix(lp$fit)
+  eta_se  <- as.matrix(lp$se.fit)
+  
+  ## mgcv multinom has K linear predictors plus one baseline class
+  prob_from_eta <- function(eta_mat) {
+    exp_eta <- exp(eta_mat)
+    denom <- 1 + rowSums(exp_eta)
+    probs <- cbind(1 / denom, exp_eta / denom)
+    colnames(probs) <- class_levels
+    probs
+  }
+  
+  n_grid <- nrow(newd_scaled)
+  n_class <- length(class_levels)
+  K <- ncol(eta_hat)
+  
+  prob_array <- array(NA, dim = c(n_grid, n_class, nsim))
+  
+  for (i in seq_len(nsim)) {
+    eta_sim <- matrix(
+      rnorm(n_grid * K,
+            mean = as.vector(eta_hat),
+            sd   = as.vector(eta_se)),
+      nrow = n_grid,
+      ncol = K
+    )
+    
+    prob_array[, , i] <- prob_from_eta(eta_sim)
+  }
+  
+  ci_df <- purrr::map_dfr(seq_along(class_levels), function(j) {
+    tibble::tibble(
+      x = newd_nat[[var]],
+      class = class_levels[j],
+      lower = apply(prob_array[, j, ], 1, quantile, probs = 0.025, na.rm = TRUE),
+      upper = apply(prob_array[, j, ], 1, quantile, probs = 0.975, na.rm = TRUE)
+    )
+  })
+  
+  out <- dplyr::bind_cols(newd_nat[var], pr) |>
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(class_levels),
+      names_to = "class",
+      values_to = "prob"
+    ) |>
+    dplyr::rename(x = dplyr::all_of(var)) |>
+    dplyr::mutate(var = var) |>
+    dplyr::left_join(ci_df, by = c("x", "class"))
+  
+  out
+}
+
+## 3) Make PD curves df (in natural units) for a few variables and calculate 10% increase unit vs probability
+vars_to_plot <- c("proportion_buildings_over6m","temp_c_mean_idw","elevation","rain_24h_mean_idw") #,"proportion_vegetation")
+pd_df <- dplyr::bind_rows(lapply(vars_to_plot, predict_pd_nat, model = best_model))
+pd_df$class <- factor(pd_df$class, levels = c("Unsuccessful","Low Success","Moderate Success","High Success"))
+pd_df$var <- factor(pd_df$var, levels = unique(pd_df$var))
+
+## 4) Plot pd curves (x-axis is in original units)
+cluster_colours <- c("Unsuccessful" = "#E6E482", "Low Success" = "#95C164", "Moderate Success" = "#428643", "High Success" = "#1B561F") # colour-blind accessible
+
+pretty_facet <- c(proportion_buildings_over6m = "Tall Buildings (%)", temp_c_mean_idw = "Temperature (°C)",
+                  proportion_vegetation = "Vegetation (%)", rain_24h_mean_idw = "Rainfall (mm)", elevation = "Elevation (m)")
+pd_curves_raw_units <- ggplot(pd_df, aes(x = x, y = prob, colour = class, fill = class)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, group = class),
+              alpha = 0.18, colour = NA, show.legend = FALSE) +
+  geom_line(aes(group = class), colour = "grey20", linewidth = 1.3) +
+  geom_line(aes(group = class), linewidth = 1) +
+  facet_wrap(~var, ncol = 2, scales = "free_x", labeller = labeller(var = pretty_facet)) +
+  scale_color_manual(values = cluster_colours) +
+  scale_fill_manual(values = cluster_colours) +
+  labs(x = NULL, y = "Predicted probability") +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(size = 14, face = "bold"),
+        axis.title.y = element_text(size = 14),
+        axis.text.x  = element_text(size = 12),
+        axis.text.y  = element_text(size = 12),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 13))
+#pd_curves_raw_units
+
+# where does the data live?
+rug_df <- dplyr::bind_rows(lapply(vars_to_plot, function(v){
+  dplyr::tibble(
+    var = v,
+    x = wmel_model_df[[v]],          # raw units
+    class = wmel_model_df$cluster
+  ) |> tidyr::drop_na(x, class)
+}))
+hist_tall_buildings <- hist(rug_df$x[rug_df$var == "proportion_buildings_over6m"], breaks = 24)
+hist_temperature <- hist(rug_df$x[rug_df$var == "temp_c_mean_idw"], breaks = 24)
+hist_rain <- hist(rug_df$x[rug_df$var == "rain_24h_mean_idw"], breaks = 24)
+hist_elevation <- hist(rug_df$x[rug_df$var == "elevation"], breaks = 24)
+
+# rug along bottom (tick-marks where data live) - scattered for rug by class
+# a) choose where each class' rug should sit (as a fraction of the y scale)
+rug_y <- c("Unsuccessful" = -0.12, "Low Success" = -0.09, "Moderate Success" = -0.06, "High Success" = -0.03)
+# b) build a “staggered rug” data frame
+#    use short lineranges so they look like rug ticks
+rug_stag <- rug_df |>
+  dplyr::mutate(
+    y0 = unname(rug_y[as.character(class)]),
+    y1 = y0 + 0.012, # height of each tick (in probability units)
+    x0 = x,
+    x1 = x
+  )
+rug_stag$var <- factor(rug_stag$var, levels = unique(pd_df$var))
+# c) add the staggered rugs as tiny vertical ticks (lineranges)
+pd_curves_raw_units +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = min(rug_y), ymax = 0, fill = "white", colour = NA) + # hide grid behind rugs with a white strip
+  geom_linerange(data = rug_stag, aes(x = x, ymin = y0, ymax = y1, colour = class), # draw the rugs on top
+                 inherit.aes = FALSE, alpha = 0.35, show.legend = FALSE) +
+  scale_y_continuous(limits = c(min(rug_y), round(max(pd_df$prob),1))) + #, expand = expansion(mult = 0))) +
+  coord_cartesian(clip = "off")
+
+```
+
+
+#### Figure: Dot-and-whisker “coefficient” plot (parametric terms)
+
+```{r dot_and_whisker, fig.height=10, fig.width=8, warning=FALSE}
+
+## Dot-and-whisker “coefficient” plot (parametric terms)
+pretty_terms <- c(
+  proportion_buildings_over6m = "Tall Buildings (%)",
+  wind_speed_mean_idw         = "Wind speed (km)",
+  temp_c_mean_idw             = "Temperature (°C)",
+  average_household_income    = "Household income",
+  proportion_non_residential  = "Non-residential (%)",
+  rain_24h_mean_idw           = "Rainfall (mm)",
+  proportion_highways         = "Highways (%)",
+  water_tank_density          = "Water tank density",
+  human_population            = "Human population (count)",
+  elevation                   = "Elevation (m)",
+  proportion_water_bodies     = "Water bodies (%)",
+  proportion_residential      = "Residential (%)",
+  proportion_vegetation       = "Vegetation (%)",
+  proportion_favela           = "Favela (%)",
+  built_volume_density        = "Residential density",
+  nres_built_volume_density   = "Non-residential density",
+  breeding_container_sum      = "Breeding container total (count: potted plants, storm drains, water tanks)",
+  proportion_no_waste_collection = "No waste collection (%)",
+  number_households_no_mains_water_connection = "No mains water connection (count)",
+  proportion_households_no_sewage_collection = "No sewage collection (%)"
+)
+
+smry <- summary(best_model)
+ptab <- as.data.frame(smry$p.table) |>
+  tibble::rownames_to_column("term_raw")
+non_base_levels <- levels(df$cluster)[-1] # c("Low Success","Moderate Success","High Success")
+ptab2 <- ptab |>
+  dplyr::mutate(
+    suff_num = stringr::str_extract(term_raw, "\\.(\\d+)$") |>
+      stringr::str_remove("^\\.") |> # pull trailing ".k" as an integer; NA means "no suffix"
+      as.integer(),
+    class_idx = dplyr::coalesce(suff_num + 1L, 1L),
+    class = non_base_levels[class_idx],
+    term  = sub("\\.\\d+$", "", term_raw)
+  ) |>
+  dplyr::filter(term != "(Intercept)", !is.na(class)) |>
+  dplyr::mutate(
+    SE    = `Std. Error`,
+    ci_lo = Estimate - 1.96 * SE,
+    ci_hi = Estimate + 1.96 * SE,
+    class = factor(class, levels = non_base_levels),
+    term_pretty = dplyr::recode(term, !!!as.list(pretty_terms))
+  ) |>
+  dplyr::filter(!is.na(term_pretty))
+present_codes  <- names(pretty_terms)[names(pretty_terms) %in% unique(ptab2$term)] # which terms present from pretty_terms
+present_labels <- unname(pretty_terms[present_codes]) # pretty text in same order
+y_levels <- rev(present_labels) # ordered for plotting
+
+offset_map <- c("Low Success" = 0.1, "Moderate Success" = 0, "High Success" = -0.1) # vertical stutter by cluster
+bands <- tibble::tibble(var = present_codes, lab = y_levels, y = seq_along(y_levels))
+plot_df <- ptab2 %>%
+  dplyr::left_join(bands, by = c("term" = "var")) %>%
+  dplyr::mutate(
+    y = y + unname(offset_map[as.character(class)])
+  )
+coef_plot <- ggplot(plot_df, aes(x = Estimate, y = y, colour = class)) +
+  geom_errorbarh(aes(xmin = ci_lo, xmax = ci_hi), width = 0, orientation = "y") +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 0, linewidth = 0.4, linetype = 2) +
+  scale_y_continuous(breaks = bands$y, labels = bands$lab, ) +
+  scale_x_continuous(breaks = seq(-2, 1.5, by = 0.5)) +
+  scale_colour_manual(values = cluster_colours) +
+  labs(x = "Log-odds (vs Unsuccessful)", y = NULL) +
+  theme_minimal() +
+  theme(panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size = 11, face = "bold"),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 11))
+coef_plot
+
+```
+
+
+#### Figure: Variable “importance” via ΔAIC (drop-one)
+
+```{r var_importance, fig.height=10, fig.width=12, warning=FALSE}
+
+## Variable “importance” via ΔAIC (drop-one)
+param_terms <- c("proportion_buildings_over6m","temp_c_mean_idw", "rain_24h_mean_idw", "elevation")
+AIC_full <- AIC(best_model)
+drop1_AIC <- function(v) {
+  kept <- setdiff(param_terms, v)
+  rhs0 <- reformulate(kept)
+  rhs_drop <- stats::update.formula(rhs0, ~ . + s(neighbouring_wmel_pctg_mean_avg, bs = "ts", k = 10))
+  f1 <- build_flist(rhs_drop, K)
+  fit <- mgcv::gam(
+    formula = f1,
+    data = df,
+    family = mgcv::multinom(K = K),
+    method = "REML",
+    select = TRUE)
+  tibble::tibble(var = v, AIC = as.numeric(AIC(fit)))
+}
+imp_tbl <- map_dfr(param_terms, drop1_AIC) %>%
+  mutate(delta_AIC = AIC - AIC_full) %>%
+  arrange(desc(delta_AIC))
+
+imp_plot <- ggplot(imp_tbl, aes(x = delta_AIC, y = reorder(var, delta_AIC))) +
+  geom_vline(xintercept = 0, linewidth = 0.4, linetype = 2) +
+  geom_col(fill = "black", width = 0.2) + # thinner bars → bigger gaps
+  geom_text(aes(x = delta_AIC - 5, label = sprintf("\u0394AIC %.0f", round(delta_AIC,0))),
+            colour = "white", fontface = "bold", size = 3, vjust = 0.5) +
+  scale_y_discrete(breaks = NULL, expand = expansion(mult = 0, add = 0.25)) + # no y-axis labels/ticks
+  labs(x = expression(Delta*AIC~"(drop-one)"), y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank())
+
+# Plot panel
+covariates_panel <- patchwork::wrap_plots(coef_plot, imp_plot, ncol = 2, widths = c(2, 1)) +
+  patchwork::plot_annotation(tag_levels = "A") &
+  ggplot2::theme(plot.tag = element_text(size = 14, face = "bold"),
+                 plot.tag.position = c(0.01, 0.98))
+covariates_panel
+
+```
+
+
+#### PD interpretation stats
+
+```{r pd_stats}
+
+# define raw data medians
+vars_to_plot <- c("proportion_buildings_over6m","temp_c_mean_idw","rain_24h_mean_idw","elevation") #,"proportion_vegetation")
+raw_medians <- c(
+  proportion_buildings_over6m = median(wmel_model_df[[vars_to_plot[1]]], na.rm = TRUE),
+  temp_c_mean_idw = median(wmel_model_df[[vars_to_plot[2]]], na.rm = TRUE),
+  rain_24h_mean_idw = median(wmel_model_df[[vars_to_plot[3]]], na.rm = TRUE),
+  elevation = median(wmel_model_df[[vars_to_plot[4]]], na.rm = TRUE)
+)
+
+# helper function to calculate change in probability
+calc_pd_change <- function(
+    pd_df, # = a model output of predictions
+    var, # = variable of interest
+    delta, # = unit change increase
+    x0 # = raw data median reference value
+    ) {
+  
+  sub <- pd_df %>% dplyr::filter(var == !!var) # establish subset of data for variable of interest
+  x1 <- x0 + delta # establish new x-value with unit increase
+  
+  # nearest PD points
+  p0 <- sub %>%
+    dplyr::group_by(class) %>%
+    dplyr::slice(which.min(abs(x - x0))) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(class, prob) %>%
+    dplyr::rename(p0 = prob)
+  p1 <- sub %>%
+    dplyr::group_by(class) %>%
+    dplyr::slice(which.min(abs(x - x1))) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(class, prob) %>%
+    dplyr::rename(p1 = prob)
+  
+  dplyr::left_join(p0, p1, by = "class") %>%
+    dplyr::mutate(var = var,
+                  x0 = x0,
+                  x1 = x1,
+                  diff = p1 - p0)
+}
+
+# calculate PD changes
+pd_buildings <- calc_pd_change(pd_df, var = "proportion_buildings_over6m", delta = 0.10, x0 = raw_medians["proportion_buildings_over6m"])
+pd_temp <- calc_pd_change(pd_df, var = "temp_c_mean_idw", delta = 0.2, x0 = raw_medians["temp_c_mean_idw"])
+pd_elev <- calc_pd_change(pd_df, var = "elevation", delta = 10, x0 = raw_medians["elevation"])
+pd_rain <- calc_pd_change(pd_df, var = "rain_24h_mean_idw", delta = 0.25, x0 = raw_medians["rain_24h_mean_idw"])
+
+pd_effects <- dplyr::bind_rows(pd_buildings, pd_temp, pd_elev, pd_rain) %>%
+  dplyr::rename(
+    trajectory_class = class,
+    baseline_probability = p0,
+    increased_probability = p1,
+    predictor = var,
+    baseline_value = x0,
+    increased_value = x1,
+    probability_change = diff
+  )
+pd_effects
+
+```
+
+#### Figure: spatial smooth splines
+
+```{r spatial_splines, fig.height=8, fig.width=8, warning=FALSE}
+
+scaled_vars <- predictors_clean2  # predictors z-scaled in the fitted model
+predict_neighbour_by_zone <- function(model,
+                                      df_unscaled = wmel_model_df,
+                                      scaled_vars = predictors_clean2,
+                                      n = 200,
+                                      hold_fun = median) {
+  focal <- "neighbouring_wmel_pctg_mean_avg"
+  stopifnot(focal %in% names(df_unscaled))
+  # 1) range of focal variable (natural units)
+  rng <- range(df_unscaled[[focal]], na.rm = TRUE)
+  grid_nat <- tibble::tibble(!!focal := seq(rng[1], rng[2], length.out = n))
+  # 2) hold other *scaled* covariates at their natural-unit medians
+  others <- setdiff(scaled_vars, focal)
+  hold_nat <- df_unscaled |>
+    dplyr::summarise(dplyr::across(dplyr::all_of(others), ~ hold_fun(.x, na.rm = TRUE)))
+  # 3) expand over release zones
+  rz_levels <- levels(df_unscaled$release_zone)
+  newd_nat  <- tidyr::crossing(grid_nat, hold_nat, tibble::tibble(release_zone = factor(rz_levels, levels = rz_levels)))
+  # 4) copy & scale only the variables that were scaled during fit
+  newd_scaled <- newd_nat
+  for (v in intersect(names(newd_scaled), scaled_vars)) {
+    newd_scaled[[v]] <- to_z(newd_nat[[v]], v)
+  }
+  # 5) predict class probabilities
+  pr <- as.data.frame(predict(model, newdata = newd_scaled, type = "response"))
+  names(pr) <- levels(df_unscaled$cluster)
+  # 6) long format with natural-unit x for plotting
+  out <- dplyr::bind_cols(newd_nat[focal], newd_nat["release_zone"], pr) |>
+    tidyr::pivot_longer(cols = levels(df_unscaled$cluster),
+                        names_to = "class", values_to = "prob") |>
+    dplyr::rename(x = dplyr::all_of(focal))
+  out
+}
+
+# Where does the data live?
+neigh_rug_df <- data.frame(x = wmel_model_df$neighbouring_wmel_pctg_mean_avg,
+                           class = wmel_model_df$cluster) |> tidyr::drop_na(x, class)
+
+# Build plotting data
+neigh_pd <- predict_neighbour_by_zone(best_model)
+neigh_pd$class <- factor(neigh_pd$class, levels = c("Unsuccessful","Low Success","Moderate Success","High Success"))
+
+# Plot: one curve per release_zone, facets by class, 0–1 y-axis
+release_zone_cols <- c("#636363", "#7D7D7D", "#979797") # based on 5-tone greyscale from release zone plot
+release_zone_linetypes <- c("solid", "longdash", "dotdash")
+spatial_splines <- ggplot(neigh_pd,
+       aes(x = x, y = prob, color = release_zone, linetype = release_zone, group = release_zone)) +
+  geom_line(linewidth = 1) +
+  scale_linetype_manual(values = release_zone_linetypes) +
+  scale_colour_manual(values = release_zone_cols) +
+  geom_rug(data = neigh_rug_df, aes(x = x), # colour = class),
+    sides = "b", alpha = 0.25, inherit.aes = FALSE) +
+  facet_wrap(~ class, scales = "fixed") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2)) +
+  labs(x = "Average neighbouring wMel (%)", y = "Predicted probability", color = "Release zone", linetype = "Release zone") +
+  theme_minimal(base_size = 11) +
+  guides(colour = guide_legend(), linetype = guide_legend()) +
+  theme(legend.position = "bottom")
+spatial_splines
+
+```
+
+
+#### Supplementary Figure 3. Observed data of selected model covariates
+Scatter plots of model covariates
+
+```{r covariate_scatter_plots, fig.height=10, fig.width=8, warning=FALSE}
+
+set.seed(1)
+covariate_raw_values_df <- wmel_model_df %>% dplyr::select(cluster,proportion_buildings_over6m,temp_c_mean_idw,rain_24h_mean_idw,elevation)
+covariate_long <- covariate_raw_values_df %>%
+  pivot_longer(all_of(vars_to_plot), names_to = "variable", values_to = "value") %>%
+  mutate(variable = factor(variable, levels = names(covariate_raw_values_df)), x = 0)
+cluster_colours <- c("Unsuccessful" = "#E6E482", "Low Success" = "#95C164", "Moderate Success" = "#428643", "High Success" = "#1B561F")
+covariate_raw_values <- ggplot(covariate_long, aes(x = x, y = value, color = cluster)) +
+  ggbeeswarm::geom_quasirandom(width = 0.35, varwidth = TRUE, alpha = 1, size = 1.6) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 2, labeller = labeller(variable = pretty_facet)) +
+  scale_x_continuous(NULL, breaks = 0, labels = "") +
+  scale_color_manual(values = cluster_colours) +
+  labs(y = "Observed data") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "bottom", legend.title = element_blank(), strip.text = element_text(size = 11, face = "bold"))
+covariate_raw_values
+
+```
+
+
+#### Scatter plots of highly correlated covariate pairs
+
+```{r high_cor_covariate_scatter_plots, fig.height=8, fig.width=8, warning=FALSE}
+
+# scatter plot of neighbouring wmel and tall buildings as correlation >0.6
+neigh_wmel_tall_buildings <- ggplot(wmel_model_df, aes(x = proportion_buildings_over6m, y = neighbouring_wmel_pctg_mean_avg)) +
+  geom_point(size = 2) +
+  labs(x = "Tall buildings (%)", y = "Mean neighbouring %wMel") +
+  theme_minimal()
+neigh_wmel_tall_buildings
+
+# scatter plot of temperature and tall buildings as correlation >0.6
+tall_buildings_temp <- ggplot(wmel_model_df, aes(x = proportion_buildings_over6m, y = temp_c_mean_idw)) +
+  geom_point(size = 2) +
+  labs(x = "Tall buildings (%)", y = "Temperature (°C)") +
+  theme_minimal()
+tall_buildings_temp
+
+# scatter plot of vegetation and tall buildings as correlation >0.6
+tall_buildings_vegetation <- ggplot(wmel_model_df, aes(x = proportion_buildings_over6m, y = proportion_vegetation)) +
+  geom_point(size = 2) +
+  labs(x = "Tall buildings (%)", y = "Proportion vegetation") +
+  theme_minimal()
+tall_buildings_vegetation
+
+```
+
+#### Boxplot of trajectories and spatial smooth 
+
+```{r trajectories_boxplots, fig.height=5, fig.width=6, warning=FALSE}
+
+## Boxplot / distribution check of neighbouring wMel across trajectory classes
+
+cluster_colours <- c(
+  "Unsuccessful" = "#E6E482",
+  "Low Success" = "#95C164",
+  "Moderate Success" = "#428643",
+  "High Success" = "#1B561F"
+)
+
+trajectory_boxplot <- ggplot(wmel_model_df, aes(x = cluster, y = neighbouring_wmel_pctg_mean_avg, fill = cluster)) +
+  geom_violin(alpha = 0.4, trim = TRUE, colour = NA) +
+  geom_boxplot(width = 0.15, outlier.alpha = 0.3, alpha = 0.6) +
+  geom_jitter(width = 0.15, alpha = 0.2, size = 1) +
+  scale_fill_manual(values = cluster_colours) +
+  labs(x = "", y = "Mean neighbouring wMel (%)") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank())
+trajectory_boxplot
+
+```
+
+
+
+
+

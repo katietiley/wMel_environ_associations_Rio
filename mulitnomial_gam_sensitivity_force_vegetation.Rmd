@@ -1,0 +1,240 @@
+---
+title: "mulitnomial_gam_sensitivity_force_vegetation"
+author: "K Tiley"
+date: "2026-05-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(dplyr)            # pipelines
+library(tidyr)            # dataframe manipulation
+library(reshape2)         # dataframe manipulation
+library(forcats)          # fct_recode()
+library(nnet)             # multinomial logistic regression
+library(mgcv)             # GAMs
+library(caret)            # regression
+library(ggplot2)          # plotting
+library(sf)               # spatial data
+library(spatialsample)    # spatial cross-validation
+library(spdep)            # spatial autocorrelation
+library(car)              # multicollinearity
+library(purrr)            # iteration (map_* etc.)
+library(rlang)
+library(tibble)
+library(stringr)
+library(ggbeeswarm)
+
+```
+
+
+## Prepare data
+
+```{r data_prep}
+
+# upload predictors
+predictors_df <- read.csv("model_predictors_df_updatedflightbarriers2025-09-30.csv", header = TRUE)
+#names(predictors_df)
+
+# upload outcome trajectories
+wmel_reassigned <- read.csv("k4_reassigned_wmel_all_2025-09-24.csv", header = TRUE)  # outcome with reassignment for decreasing slopes
+
+# prepare model dataframes
+wmel_clustered_num <- wmel_reassigned %>%
+  filter(!is.na(cluster)) %>%                                                                               # remove rows where cluster is NA
+  mutate(cluster = factor(cluster, levels = c("Unsuccessful","Low Success","Moderate Success","High Success")),
+         cluster_num = dplyr::recode(as.character(cluster), "Unsuccessful" = 3L, "Low Success" = 4L, "Moderate Success" = 2L, "High Success" = 1L,
+                                     .default = NA_integer_, .missing = NA_integer_),
+         release_zone = factor(release_zone)) %>%
+  distinct(cell.id, .keep_all = TRUE) %>%                                                                   # retain one row (and cluster label) per cell.id
+  dplyr::select(cell.id, cluster, cluster_num, x, y, release_zone)
+
+wmel_model_df <- wmel_clustered_num %>%
+  dplyr::select(cell.id, cluster, release_zone) %>%
+  left_join(predictors_df, by = "cell.id") %>%
+  mutate(across(
+    .cols = -c(cell.id, cluster, release_zone),
+    .fns = ~ replace_na(., 0)
+    ),
+    release_zone5 = release_zone,
+    release_zone = case_when(
+      release_zone5 %in% c("RJ3.1", "RJ3.2", "RJ3.3") ~ "RJ3",
+      release_zone5 == "RJ2" ~ "RJ2",
+      TRUE ~ "RJ1"
+    ),
+    release_zone = factor(release_zone)
+  )
+
+# predictor pool (exclude id, response, coords)
+predictors_og <- setdiff(
+  names(wmel_model_df),
+  c("cell.id", "cluster", "neighbouring_wmel_pctg_mean_avg", "release_zone", "release_zone5")
+)
+
+```
+
+
+## Predictors
+
+#### Tranformation for high Variance Inflation Factors (VIF)
+
+As a rule of thumb:
+-  <5 low, 5-10 moderate
+-  >10 high multicollinearity & consider removing or combining
+-  >30 severe multicollinearity & must address as model is not valid
+
+Problem: proportion_residential & proportion_non_residential
+Resolution: 'residualise' proportion_non_residential so that the non-residential buffer effect is retained without the non-residential data trends explained by proportion_residential
+How: fit a model to get residuals, but which model? -> evidence of non-linearity, so fit a GAM.
+
+```{r pred_vif_refine}
+
+aux <- mgcv::gam(proportion_non_residential ~ s(proportion_residential, k = 6), data = wmel_model_df, method = "REML")
+wmel_model_df$proportion_non_residential <- resid(aux)
+
+```
+
+
+## Scale predictors
+
+Scale predictors for comparable coefficients which tell you the expected change in log-odds per 1 SD increase in the predictor. Method: subtract predictor mean and divide by SD.
+
+```{r pred_scaled}
+
+predictors_clean2 <- c("proportion_buildings_over6m", "temp_c_mean_idw", "elevation", "rain_24h_mean_idw", "proportion_vegetation")
+wmel_model_df_scaled <- wmel_model_df[, c(predictors_clean2, "cell.id", "cluster", "release_zone", "neighbouring_wmel_pctg_mean_avg")] %>%
+  mutate(across(all_of(predictors_clean2), ~ as.numeric(scale(.x))))
+#summary(wmel_model_df_scaled)
+
+```
+
+
+## Model data and helper function
+
+```{r screening_df}
+
+# final model dataframe
+wmel_model_df_scaled_subset <- wmel_model_df_scaled %>%
+  dplyr::select(any_of(c(predictors_clean2, "cluster", "release_zone", "neighbouring_wmel_pctg_mean_avg")))
+df <- droplevels(wmel_model_df_scaled_subset)
+
+df$cluster <- relevel(df$cluster, ref = "Unsuccessful")
+df$cluster_code <- as.numeric(df$cluster) - 1L                                                            # recode response to integers 0..K with desired baseline as 0
+K <- max(df$cluster_code)
+f_list0 <- list(cluster_code ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone), ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone), ~s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone))
+m0 <- gam(f_list0, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)  # intercept-only reference model
+aic_base <- AIC(m0)
+
+```
+
+```{r screening_helpers}
+
+build_flist_linear <- function(
+    rhs, K, resp = "cluster_code",
+    k = 10, bs = "ts"
+    ){
+
+  # rhs  = RHS formula like ~ x1 + x2 + x3
+  # K    = number of classes
+  # resp = response variable name
+  # k    = default basis size (scalar, default 10) OR a *named* numeric vec per var
+  # bs   = basis for s(), default "ts" (thin-plate w/ shrinkage)
+  
+  stopifnot(inherits(rhs, "formula"), K >= 2)
+  
+  term_labels <- xfun::attr2(terms(rhs), "term.labels")
+  
+  pick_k <- function(v) {
+    if (length(k) > 1 && !is.null(names(k)) && v %in% names(k)) k[[v]] else as.numeric(k)[1]
+  }
+  
+  # always add the spatial proxy smooth
+#  spatial_proxy <- "s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10)"
+#  spatial_proxy <- "s(release_zone, bs='re')"
+  spatial_proxy <- "s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone)"
+
+
+  # assemble RHS (deduplicate, preserve first occurrence)
+  rhs_terms <- unique(c(term_labels, spatial_proxy))
+  rhs_new   <- as.formula(paste("~", paste(rhs_terms, collapse = " + ")))
+  
+  # mgcv multinomial formula list: first has response, rest are RHS
+  c(list(update(rhs_new, paste(resp, "~ ."))),
+    rep(list(rhs_new), K - 1))
+}
+
+```
+
+
+## Selected model
+
+```{r best_model}
+
+best_rhs <- ~ proportion_buildings_over6m + temp_c_mean_idw + elevation + rain_24h_mean_idw
+best_flist <- build_flist_linear(best_rhs, K)
+best_model <- mgcv::gam(best_flist, data = df, family = mgcv::multinom(K = K), method = "REML", select = TRUE, na.action = na.exclude)
+print(summary(best_model))
+
+cat("\nBest_model AIC:\n")
+print(AIC(best_model))
+
+```
+
+95%CIs from model summary SE:
+```{r model_95pct_CI}
+
+# extract parametric coefficient table
+coef_summary <- summary(best_model) # model summary
+coef_betas <- coef_summary$p.coeff # just betas
+coef_SEs <- coef_summary$se # just standard errors
+param_SEs <- coef_SEs[names(coef_SEs) %in% names(coef_betas)] # keep only SE values with names matching the parametric coefficient names (not spatial smooths)
+coef_ps <- coef_summary$p.pv # just p-values
+# 95% CI using normal approximation
+zcrit <- qnorm(1 - 0.05/2)  # 1.96 for 95% CI
+# make summary table with 95%CI
+coef_tab_ci <- cbind(
+  coef_betas,
+  param_SEs,
+  CI_lower = coef_betas - zcrit * param_SEs,
+  CI_upper = coef_betas + zcrit * param_SEs,
+  coef_ps
+)
+coef_tab_ci
+
+```
+
+#### Confusion martrix
+
+Confusion matrix: observed vs predicted clusters
+```{r confusion_matrix}
+
+levs <- levels(wmel_model_df_scaled$cluster)                                                              # assign levels
+predicted_probs <- predict(best_model, type = "response")                                                  # calculate residuals per cluster
+colnames(predicted_probs) <- levs                                                                         # assign colnames
+predicted_class <- factor(colnames(predicted_probs)[max.col(predicted_probs, ties.method = "first")], levels = levs)  # predicted clusters
+observed_class <- factor(wmel_model_df_scaled$cluster, levels = levs)                                    # observed clusters
+confusion_matrix <- caret::confusionMatrix(predicted_class, observed_class)
+confusion_matrix
+
+```
+
+
+## Sensitivity analysis: force vegetation into the final model
+
+```{r best_model_plus_favelas}
+
+best_rhs_vegetation <- ~ proportion_buildings_over6m + temp_c_mean_idw + elevation + rain_24h_mean_idw + proportion_vegetation
+best_flist_vegetation <- build_flist_linear(best_rhs_vegetation, K)
+best_model_vegetation <- mgcv::gam(best_flist_vegetation, data = df, family = mgcv::multinom(K = K), method = "REML", select = TRUE, na.action = na.exclude)
+print(summary(best_model_vegetation))
+
+cat("\nBest_model_vegetation AIC:\n")
+print(AIC(best_model_vegetation))
+
+```
+
+
+
+Conclusion:
+We forced the proportion of vegetation covariate to be included in the final model, which had positive effect sizes across all trajectories, reaching statistical significance only for the high success trajectory (β = 0.10 (95%CI: -0.55, 0.76), β = 0.44 (95%CI: -0.08, 0.97), β = 0.61 (95%CI: 0.10, 1.12); low, moderate and high success, respectively).
+
