@@ -1,12 +1,12 @@
-# wMel_environ_associations_Rio
-Supporting the manuscript "Climate and landscape features associated with successful Wolbachia replacement in the municipality of Rio de Janeiro, Brazil"
+Supporting the manuscript:
+# Climate and landscape features associated with successful Wolbachia replacement in the municipality of Rio de Janeiro, Brazil
 
-## Abstract:
-#### Background
+#### Abstract:
+###### Background
 Wolbachia replacement is a promising strategy for reducing arboviral transmission by Aedes aegypti. Wolbachia-infection is refractory to arboviruses, including dengue and chikungunya, and Wolbachia spreads in mosquito populations by maternal transmission and cytoplasmic incompatibility, whereby mating between infected males and uninfected females produce non-viable offspring. Deployment programmes seek to establish stable, high Wolbachia prevalence through the release of Wolbachia-infected mosquitoes, however, prevalence varies spatially, particularly in complex urban environments where fine-scale heterogeneity in temperature and built environment may influence mosquito population dynamics. Here, we investigate how climate and landscape features are associated with heterogeneous Wolbachia replacement outcomes using wMel prevalence data from releases in the municipality of Rio de Janeiro, Brazil (2017–2019).
-#### Methods
+###### Methods
 Across a 26-month period, 500 x 500 m spatial units were clustered into four distinct replacement trajectories: unsuccessful, low, moderate, and high success, defined using predicted Wolbachia prevalence time series generated from cell-level binomial regression models and grouped using k-means clustering. Associations were explored between each trajectory and features related to Ae. aegypti habitat suitability, climate sensitivity, flight barriers, and Wolbachia deployment barriers using a multinomial generalised additive model (GAM). We used forward selection based on Akaike Information Criterion, explicit consideration of spatial autocorrelation and screened for collinearity among covariates. Of the 23 covariates examined, four covariates were retained: proportion of tall buildings (% >6m in height), average air temperature (°C), average elevation (m above sea level), and average daily rainfall (mm).
-#### Results
+###### Results
 Results show high replacement success was mostly associated with areas with fewer tall buildings (β = -0.93 (95%CI: -1.43, -0.44), p < 0.001) and higher temperatures (β = 1.11 (95%CI: 0.59, 1.62), p < 0.001), while higher elevation and lower rainfall were associated with poorer outcomes. These associations may also reflect unmeasured socioeconomic or infrastructure variation, and context-dependent temperature effects on mosquito and Wolbachia fitness. Model-based predictions indicate non-linear dynamics, with areas of more tall buildings and higher temperatures showing divergent predicted outcomes towards either high success or failure rather than intermediate replacement. Residual spatial clustering suggests additional neighbourhood-scale processes not captured by the available covariates.
-#### Conclusions
+###### Conclusions
 Outcomes in high-rise and topographically complex areas appear less likely to stabilise at intermediate replacement. Such areas may require higher release densities, targeted supplemental interventions, and more intensive monitoring, although these remain hypotheses requiring empirical evaluation. Through iterative modelling it is possible to support rapid hypothesis identification to inform field-tests and operational refinement as more evidence becomes available. These findings reinforce the role of urban permeability, vertical structure, and local environmental conditions in shaping the outcomes of Wolbachia replacement programmes.
