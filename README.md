@@ -1,5 +1,7 @@
 Supporting the manuscript:  
 # Climate and landscape features associated with successful Wolbachia replacement in the municipality of Rio de Janeiro, Brazil  
+Authors: Katie Tiley, Katie Milligan Susong, Steffen Knoblauch, Kathleen M O’Reilly, and Oliver Brady
+
   
 #### Abstract:  
   
@@ -44,7 +46,7 @@ Outcomes in high-rise and topographically complex areas appear less likely to st
    6. multinomial_gam_sensitivity_building_height_definition.Rmd
    7. multinomial_gam_sensitivity_favela_by_elevation.Rmd
   
-**Note:** The scripts are intended to be run sequentially, as intermediate objects generated in earlier steps are used by subsequent analyses. All required data is included in this repository, except raw Brazil Census 2022 https://ftp.ibge.gov.br/Censos/Censo_Demografico_2022/ and household income https://ftp.ibge.gov.br/Censos/Censo_Demografico_2022/Agregados_por_Setores_Censitarios_Rendimento_do_Responsavel/. The required files are: Agregados_por_bairros_renda_responsavel_BR.csv, Agregados_por_setores_alfabetizacao_BR.csv, Agregados_por_setores_basico_BR_20250417.csv, Agregados_por_setores_caracteristicas_domicilio2_BR_20250417.csv, RJ_bairros_CD2022.gpkg, RJ_setores_CD2022.gpkg.  
+**Note:** The scripts are intended to be run sequentially, as intermediate objects generated in earlier steps are used by subsequent analyses. All required data is included in this repository, except raw Brazil Census 2022 https://ftp.ibge.gov.br/Censos/Censo_Demografico_2022/ and household income https://ftp.ibge.gov.br/Censos/Censo_Demografico_2022/Agregados_por_Setores_Censitarios_Rendimento_do_Responsavel/. The required files are: Agregados_por_bairros_renda_responsavel_BR.csv, Agregados_por_setores_alfabetizacao_BR.csv, Agregados_por_setores_basico_BR_20250417.csv, Agregados_por_setores_caracteristicas_domicilio2_BR_20250417.csv, RJ_bairros_CD2022.gpkg, RJ_setores_CD2022.gpkg. Also not included are the files GSV_container_counts.json and water_tank_density.tif, which are available upon request from Dr Steffen Knoblauch.
   
 <br>
   
