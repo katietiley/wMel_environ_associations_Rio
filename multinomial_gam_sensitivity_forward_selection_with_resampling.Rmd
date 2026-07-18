@@ -1,0 +1,442 @@
+---
+title: "multinomial_gam_sensitivity_forward_selection_with_resampling"
+author: "K Tiley"
+date: "2026-07-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(dplyr)            # pipelines
+library(tidyr)            # dataframe manipulation
+library(reshape2)         # dataframe manipulation
+library(forcats)          # fct_recode()
+library(nnet)             # multinomial logistic regression
+library(mgcv)             # GAMs
+library(caret)            # regression
+library(ggplot2)          # plotting
+library(sf)               # spatial data
+library(spatialsample)    # spatial cross-validation
+library(spdep)            # spatial autocorrelation
+library(car)              # multicollinearity
+library(purrr)            # iteration (map_* etc.)
+library(rlang)
+library(tibble)
+library(stringr)
+library(ggbeeswarm)
+library(parallel)
+
+```
+
+
+## Prepare data
+
+```{r data_prep}
+
+# upload predictors
+predictors_df <- read.csv("model_predictors_df_updatedflightbarriers2025-09-30.csv", header = TRUE)
+#names(predictors_df)
+
+# upload outcome trajectories
+wmel_reassigned <- read.csv("k4_reassigned_wmel_all_2025-09-24.csv", header = TRUE)  # outcome with reassignment for decreasing slopes
+
+# prepare model dataframes
+wmel_clustered_num <- wmel_reassigned %>%
+  filter(!is.na(cluster)) %>%                                                                               # remove rows where cluster is NA
+  mutate(cluster = factor(cluster, levels = c("Unsuccessful","Low Success","Moderate Success","High Success")),
+         cluster_num = dplyr::recode(as.character(cluster), "Unsuccessful" = 3L, "Low Success" = 4L, "Moderate Success" = 2L, "High Success" = 1L,
+                                     .default = NA_integer_, .missing = NA_integer_),
+         release_zone = factor(release_zone)) %>%
+  distinct(cell.id, .keep_all = TRUE) %>%                                                                   # retain one row (and cluster label) per cell.id
+  dplyr::select(cell.id, cluster, cluster_num, x, y, release_zone)
+
+wmel_model_df <- wmel_clustered_num %>%
+  dplyr::select(cell.id, cluster, release_zone) %>%
+  left_join(predictors_df, by = "cell.id") %>%
+  mutate(across(
+    .cols = -c(cell.id, cluster, release_zone),
+    .fns = ~ replace_na(., 0)
+    ),
+    release_zone5 = release_zone,
+    release_zone = case_when(
+      release_zone5 %in% c("RJ3.1", "RJ3.2", "RJ3.3") ~ "RJ3",
+      release_zone5 == "RJ2" ~ "RJ2",
+      TRUE ~ "RJ1"
+    ),
+    release_zone = factor(release_zone)
+  )
+
+# predictor pool (exclude id, response, coords)
+predictors_og <- setdiff(
+  names(wmel_model_df),
+  c("cell.id", "cluster", "neighbouring_wmel_pctg_mean_avg", "release_zone", "release_zone5")
+)
+
+```
+
+
+## Predictors
+
+#### Tranformation for high Variance Inflation Factors (VIF)
+
+As a rule of thumb:
+-  <5 low, 5-10 moderate
+-  >10 high multicollinearity & consider removing or combining
+-  >30 severe multicollinearity & must address as model is not valid
+
+Problem: proportion_residential & proportion_non_residential
+Resolution: 'residualise' proportion_non_residential so that the non-residential buffer effect is retained without the non-residential data trends explained by proportion_residential
+How: fit a model to get residuals, but which model? -> evidence of non-linearity, so fit a GAM.
+
+```{r pred_vif_refine}
+
+aux <- mgcv::gam(proportion_non_residential ~ s(proportion_residential, k = 6), data = wmel_model_df, method = "REML")
+wmel_model_df$proportion_non_residential <- resid(aux)
+
+```
+
+
+## Scale predictors
+
+Scale predictors for comparable coefficients which tell you the expected change in log-odds per 1 SD increase in the predictor. Method: subtract predictor mean and divide by SD.
+
+```{r pred_scaled}
+
+predictors_clean2 <- c("proportion_buildings_over6m", "temp_c_mean_idw", "elevation", "rain_24h_mean_idw")
+wmel_model_df_scaled <- wmel_model_df[, c(predictors_clean2, "cell.id", "cluster", "release_zone", "neighbouring_wmel_pctg_mean_avg")] %>%
+  mutate(across(all_of(predictors_clean2), ~ as.numeric(scale(.x))))
+#summary(wmel_model_df_scaled)
+
+```
+
+
+## Model data and helper function
+
+```{r screening_df}
+
+# final model dataframe
+wmel_model_df_scaled_subset <- wmel_model_df_scaled %>%
+  dplyr::select(any_of(c(predictors_clean2, "cluster", "release_zone", "neighbouring_wmel_pctg_mean_avg")))
+df <- droplevels(wmel_model_df_scaled_subset)
+
+df$cluster <- relevel(df$cluster, ref = "Unsuccessful")
+df$cluster_code <- as.numeric(df$cluster) - 1L                                                            # recode response to integers 0..K with desired baseline as 0
+K <- max(df$cluster_code)
+f_list0 <- list(cluster_code ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone), ~ s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone), ~s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone))
+m0 <- gam(f_list0, data = df, family = mgcv::multinom(K = K), method = "ML", select = TRUE, na.action = na.exclude)  # intercept-only reference model
+aic_base <- AIC(m0)
+
+```
+
+```{r screening_helpers}
+
+build_flist_linear <- function(
+    rhs, K, resp = "cluster_code",
+    k = 10, bs = "ts"
+    ){
+
+  # rhs  = RHS formula like ~ x1 + x2 + x3
+  # K    = number of classes
+  # resp = response variable name
+  # k    = default basis size (scalar, default 10) OR a *named* numeric vec per var
+  # bs   = basis for s(), default "ts" (thin-plate w/ shrinkage)
+  
+  stopifnot(inherits(rhs, "formula"), K >= 2)
+  
+  term_labels <- xfun::attr2(terms(rhs), "term.labels")
+  
+  pick_k <- function(v) {
+    if (length(k) > 1 && !is.null(names(k)) && v %in% names(k)) k[[v]] else as.numeric(k)[1]
+  }
+  
+  # always add the spatial proxy smooth
+#  spatial_proxy <- "s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10)"
+#  spatial_proxy <- "s(release_zone, bs='re')"
+  spatial_proxy <- "s(neighbouring_wmel_pctg_mean_avg, bs='ts', k=10, by=release_zone)"
+
+
+  # assemble RHS (deduplicate, preserve first occurrence)
+  rhs_terms <- unique(c(term_labels, spatial_proxy))
+  rhs_new   <- as.formula(paste("~", paste(rhs_terms, collapse = " + ")))
+  
+  # mgcv multinomial formula list: first has response, rest are RHS
+  c(list(update(rhs_new, paste(resp, "~ ."))),
+    rep(list(rhs_new), K - 1))
+}
+
+```
+
+
+## Selected model
+
+```{r best_model}
+
+best_rhs <- ~ proportion_buildings_over6m + temp_c_mean_idw + elevation + rain_24h_mean_idw
+best_flist <- build_flist_linear(best_rhs, K)
+best_model <- mgcv::gam(best_flist, data = df, family = mgcv::multinom(K = K), method = "REML", select = TRUE, na.action = na.exclude)
+print(summary(best_model))
+
+cat("\nBest_model AIC:\n")
+print(AIC(best_model))
+
+```
+
+95%CIs from model summary SE:
+```{r model_95pct_CI}
+
+# extract parametric coefficient table
+coef_summary <- summary(best_model) # model summary
+coef_betas <- coef_summary$p.coeff # just betas
+coef_SEs <- coef_summary$se # just standard errors
+param_SEs <- coef_SEs[names(coef_SEs) %in% names(coef_betas)] # keep only SE values with names matching the parametric coefficient names (not spatial smooths)
+coef_ps <- coef_summary$p.pv # just p-values
+# 95% CI using normal approximation
+zcrit <- qnorm(1 - 0.05/2)  # 1.96 for 95% CI
+# make summary table with 95%CI
+coef_tab_ci <- cbind(
+  coef_betas,
+  param_SEs,
+  CI_lower = coef_betas - zcrit * param_SEs,
+  CI_upper = coef_betas + zcrit * param_SEs,
+  coef_ps
+)
+coef_tab_ci
+
+```
+
+#### Confusion martrix
+
+Confusion matrix: observed vs predicted clusters
+```{r confusion_matrix}
+
+levs <- levels(wmel_model_df_scaled$cluster)                                                              # assign levels
+predicted_probs <- predict(best_model, type = "response")                                                  # calculate residuals per cluster
+colnames(predicted_probs) <- levs                                                                         # assign colnames
+predicted_class <- factor(colnames(predicted_probs)[max.col(predicted_probs, ties.method = "first")], levels = levs)  # predicted clusters
+observed_class <- factor(wmel_model_df_scaled$cluster, levels = levs)                                    # observed clusters
+confusion_matrix <- caret::confusionMatrix(predicted_class, observed_class)
+confusion_matrix
+
+```
+
+
+## Sensitivity analysis: bootstrap stability analysis of forward selection
+
+Resample raster cells with replacement over ≥500 iterations, re-running forward selection on each resample, and report the selection frequency of each of the 23 candidate covariates.
+
+Helper function to re-run forward selection:
+Start with null model -> Fit every univariate model -> Choose best -> Fit every remaining variable -> Choose best -> Repeat until ΔAIC > -2
+
+```{r forward_selection_helper}
+
+forward_select <- function(data,
+                           predictors,
+                           K){
+
+    selected <- character(0)
+    remaining <- predictors
+    current_formula <- ~1
+    current_model <- gam(
+        build_flist_linear(current_formula, K),
+        data = data,
+        family = mgcv::multinom(K = K),
+        method = "ML",
+        select = TRUE
+    )
+
+    current_AIC <- AIC(current_model)
+    
+    history <- data.frame(step = integer(),
+                          variable = character(),
+                          AIC = numeric(),
+                          dAIC = numeric(),
+                          stringsAsFactors = FALSE)
+    
+    repeat{
+      if(length(remaining) == 0)
+        break
+      
+      results <- lapply(remaining,function(v){
+        
+        test_formula <- update(current_formula, paste(". ~ . +", v))
+        
+        fit <- tryCatch({
+          
+          model <- gam(
+            build_flist_linear(test_formula, K),
+            data = data,
+            family = mgcv::multinom(K = K),
+            method = "ML",
+            select = TRUE)
+          
+          data.frame(variable = v,
+                     AIC = AIC(model))
+          
+          }, error = function(e){
+            
+            data.frame(variable = v,
+                       AIC = Inf)
+            
+            })
+        
+        fit
+        
+        }) |>
+        bind_rows()
+      
+      if(all(!is.finite(results$AIC)))
+        break
+        
+        results$dAIC <- results$AIC - current_AIC
+        best <- results[which.min(results$AIC), ]
+        improvement <- current_AIC - best$AIC
+        if(improvement < 2)
+            break
+        
+        history <- rbind(history,
+                         data.frame(step = nrow(history) + 1,
+                                    variable = best$variable,
+                                    AIC = best$AIC,
+                                    dAIC = improvement))
+        selected <- c(selected, best$variable)
+        remaining <- setdiff(remaining, best$variable)
+        current_formula <- update(current_formula, paste(". ~ . +", best$variable))
+        current_AIC <- best$AIC
+    }
+
+    list(selected = selected,
+         n_selected = length(selected),
+         history = history,
+         final_AIC = current_AIC)
+
+}
+
+```
+
+```{r bootstrap_forward_selection_stability}
+
+drops <- c("proportion_flood_prone","average_literacy","humidity_mean_idw","built_volume_density")
+predictors_boot <- setdiff(predictors_og, drops)
+
+set.seed(1234)
+n_iterations <- 500
+n_cores <- 8
+cl <- makeCluster(n_cores)
+
+clusterExport(cl, c("df", "predictors_boot", "K", "forward_select", "build_flist_linear"))
+
+invisible(
+clusterEvalQ(cl, {
+  library(mgcv)
+  library(dplyr)
+  library(xfun)
+})
+)
+
+boot_results <- parLapply(
+  cl,
+  seq_len(n_iterations),
+  function(i){
+
+    boot_df <- df[sample.int(nrow(df), replace = TRUE), ]
+
+    tryCatch({
+
+      res <- forward_select(data = boot_df,
+                            predictors = predictors_boot,
+                            K = K)
+      res$iteration <- i
+      res
+
+    }, error = function(e){
+
+      list(selected = character(0),
+           n_selected = NA_integer_,
+           history = NULL,
+           final_AIC = NA_real_,
+           iteration = i,
+           error = conditionMessage(e))
+      
+    })
+  }
+)
+
+stopCluster(cl)
+
+```
+
+
+```{r samples_converged}
+
+# How many bootstrap samples converged?
+
+boot_results <- Filter(function(x) is.null(x$error), boot_results)
+n_success <- length(boot_results)
+n_failed <- n_iterations - n_success
+cat(n_success, "of", n_iterations, "bootstrap samples converged;", n_failed, "failed.\n")
+
+```
+
+```{r selection_frequency}
+
+# In how many bootstrap samples was each covariate selected?
+
+selected_vars <- lapply(boot_results, `[[`, "selected")
+
+selection_counts <- tibble(variable = unlist(selected_vars)) |>
+  count(variable, name = "times_selected")
+
+selection_frequency <- tibble(variable = predictors_boot) |>
+  left_join(selection_counts, by = "variable") |>
+  mutate(times_selected = coalesce(times_selected, 0L),
+         frequency = round(times_selected / n_success, 3)) |>
+  arrange(desc(frequency), variable)
+
+selection_frequency
+
+```
+
+```{r n_selected}
+
+# How many bootstrap samples retained # number of variables?
+
+n_selected_summary <- tibble(n_selected = sapply(boot_results, `[[`, "n_selected")) |>
+  count(n_selected, name = "bootstrap_samples") |>
+  mutate(percent = round(100 * bootstrap_samples / sum(bootstrap_samples), 1))
+
+n_selected_summary
+
+```
+
+```{r boot_stability}
+
+# How stable is the ordering?
+
+first_selected <- tibble(first_variable = sapply(boot_results, function(x) x$history$variable[1])) |>
+  count(first_variable, name = "times_first_selected") |>
+  mutate(frequency = round(times_first_selected / n_success, 3)) |>
+  arrange(desc(times_first_selected))
+
+first_selected
+
+```
+
+```{r boot_stepwise}
+
+# What does step by step selection look like?
+
+step_summary <- step_history |>
+  count(step, variable, name = "times_selected") |>
+  group_by(step) |>
+  mutate(frequency = round(times_selected / sum(times_selected), 3)) |>
+  arrange(step, desc(times_selected))
+
+step_summary
+
+```
+
+
+Conclusion:
+Overall, the bootstrap sensitivity analysis indicates that the principal findings are not driven by instability of the forward-selection procedure. The strongest support was consistently observed for the proportion of tall buildings and average air temperature, while elevation and rainfall showed more moderate selection stability.
+
+
