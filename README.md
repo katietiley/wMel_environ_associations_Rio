@@ -38,13 +38,14 @@ Outcomes in high-rise and topographically complex areas appear less likely to st
    1. multinomial_gam.Rmd
 
 4. **Run sensitivity analyses**
-   1. multinomial_gam_sensitivity_without_trajectory_reassignment.Rmd
-   2. multinomial_gam_sensitivity_bootstrapped_model_selection.Rmd
-   3. multinomial_gam_sensitivity_fixed_release_zones.Rmd
-   4. multinomial_gam_sensitivity_force_favelas.Rmd
-   5. multinomial_gam_sensitivity_force_vegetation.Rmd
-   6. multinomial_gam_sensitivity_building_height_definition.Rmd
-   7. multinomial_gam_sensitivity_favela_by_elevation.Rmd
+   1. multinomial_gam_sensitivity_forward_selection_with_resampling.Rmd
+   2. multinomial_gam_sensitivity_without_trajectory_reassignment.Rmd
+   3. multinomial_gam_sensitivity_bootstrapped_model_selection.Rmd
+   4. multinomial_gam_sensitivity_fixed_release_zones.Rmd
+   5. multinomial_gam_sensitivity_force_favelas.Rmd
+   6. multinomial_gam_sensitivity_force_vegetation.Rmd
+   7. multinomial_gam_sensitivity_building_height_definition.Rmd
+   8. multinomial_gam_sensitivity_favela_by_elevation.Rmd
   
 <br>
   
